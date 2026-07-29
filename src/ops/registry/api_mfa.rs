@@ -351,7 +351,7 @@ fn timeout_from_expires_at(expires_at: Option<&str>) -> Duration {
 
 fn timeout_hint(registry: &Registry<RegistryClient<'_>>) -> &'static str {
     if registry.host_is_crates_io() {
-        ", or authorize for 15 minutes under Settings → API MFA on crates.io"
+        "; restart the exact command to create a fresh challenge"
     } else {
         ", or authorize MFA with your registry"
     }
