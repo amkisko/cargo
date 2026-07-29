@@ -25,6 +25,8 @@ use super::RegistryClient;
 const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(2);
 /// Fastest allowed poll rate (avoids busy-loops from `recommended_poll_interval_secs: 0`).
 const MIN_POLL_INTERVAL: Duration = Duration::from_secs(1);
+/// Slowest allowed poll rate (avoids malicious registries hanging cargo with huge intervals).
+const MAX_POLL_INTERVAL: Duration = Duration::from_secs(30);
 /// Fallback MFA ceremony timeout when `expires_at` is missing or unparsable.
 const DEFAULT_MFA_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 /// Cap how many MFA handshakes a single mutate call may perform.
@@ -64,9 +66,8 @@ fn wait_for_api_mfa(
     registry: &mut Registry<RegistryClient<'_>>,
     mfa: &MfaRequired,
 ) -> CargoResult<()> {
-    gctx.shell().note(
-        "API MFA required; complete verification in your browser, then Cargo will retry",
-    )?;
+    gctx.shell()
+        .note("API MFA required; complete verification in your browser, then Cargo will retry")?;
     gctx.shell().status(
         "Verifying",
         format!("please visit {}", mfa.verification_url),
@@ -81,7 +82,19 @@ fn wait_for_api_mfa(
     progress.tick_now(0, max, "for MFA acknowledgment")?;
 
     loop {
-        std::thread::sleep(interval);
+        let elapsed = started.elapsed();
+        if elapsed > timeout {
+            bail!(
+                "timed out waiting for API MFA acknowledgment; \
+                 visit {} and retry{}",
+                mfa.verification_url,
+                timeout_hint(registry)
+            );
+        }
+        let sleep_for = interval.min(timeout.saturating_sub(elapsed));
+        if !sleep_for.is_zero() {
+            std::thread::sleep(sleep_for);
+        }
 
         let elapsed = started.elapsed();
         if elapsed > timeout {
@@ -92,11 +105,18 @@ fn wait_for_api_mfa(
                 timeout_hint(registry)
             );
         }
-        progress.tick_now(elapsed.as_secs().min(max as u64) as usize, max, "for MFA acknowledgment")?;
+        progress.tick_now(
+            elapsed.as_secs().min(max as u64) as usize,
+            max,
+            "for MFA acknowledgment",
+        )?;
 
         let status = match registry.poll_mfa_challenge(&mfa.poll_url) {
             Ok(status) => status,
-            Err(RegistryError::InvalidMfaPollUrl { poll_url, registry_host }) => {
+            Err(RegistryError::InvalidMfaPollUrl {
+                poll_url,
+                registry_host,
+            }) => {
                 bail!(
                     "refusing to poll MFA status at `{poll_url}`; \
                      URL must use the same origin as the registry API ({registry_host})"
@@ -135,7 +155,7 @@ fn clamp_poll_interval(recommended_secs: Option<u64>) -> Duration {
     recommended_secs
         .map(Duration::from_secs)
         .unwrap_or(DEFAULT_POLL_INTERVAL)
-        .max(MIN_POLL_INTERVAL)
+        .clamp(MIN_POLL_INTERVAL, MAX_POLL_INTERVAL)
 }
 
 fn timeout_from_expires_at(expires_at: Option<&str>) -> Duration {

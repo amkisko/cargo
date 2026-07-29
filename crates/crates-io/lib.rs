@@ -545,12 +545,7 @@ impl<T: HttpClient> Registry<T> {
             }
         }
 
-        let errors = api_errors.map(|s| {
-            s.errors
-                .into_iter()
-                .map(|s| s.detail)
-                .collect::<Vec<_>>()
-        });
+        let errors = api_errors.map(|s| s.errors.into_iter().map(|s| s.detail).collect::<Vec<_>>());
 
         match (head.status, errors) {
             (code, None) if code.is_success() => Ok(body),
@@ -679,6 +674,9 @@ mod tests {
             "https://crates.io:443/api/v1/mfa/challenges/mfa_x",
             "http://crates.io",
         ));
-        assert!(!url_shares_origin_with_registry("not a url", "https://crates.io"));
+        assert!(!url_shares_origin_with_registry(
+            "not a url",
+            "https://crates.io"
+        ));
     }
 }

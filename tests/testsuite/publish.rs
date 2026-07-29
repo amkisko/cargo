@@ -5000,7 +5000,9 @@ fn api_mfa_required_then_retry() {
 
     let auths = poll_auths2.lock().unwrap();
     assert!(
-        auths.iter().all(|a| a.as_ref().is_some_and(|t| !t.is_empty())),
+        auths
+            .iter()
+            .all(|a| a.as_ref().is_some_and(|t| !t.is_empty())),
         "MFA poll requests should include Authorization: {auths:?}"
     );
 }

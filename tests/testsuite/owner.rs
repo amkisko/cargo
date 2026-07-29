@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::prelude::*;
 use cargo_test_support::project;
-use cargo_test_support::registry::{self, api_path, RegistryBuilder, Response};
+use cargo_test_support::registry::{self, RegistryBuilder, Response, api_path};
 use cargo_test_support::str;
 
 fn setup(name: &str, content: Option<&str>) {
