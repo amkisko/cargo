@@ -47,7 +47,10 @@ pub fn modify_owners(gctx: &GlobalContext, opts: &OwnersOptions) -> CargoResult<
 
     if let Some(ref v) = opts.to_add {
         let v = v.iter().map(|s| &s[..]).collect::<Vec<_>>();
-        let msg = registry.add_owners(&name, &v).with_context(|| {
+        let msg = super::api_mfa::with_api_mfa_retry(gctx, &mut registry, |registry| {
+            registry.add_owners(&name, &v)
+        })
+        .with_context(|| {
             format!(
                 "failed to invite owners to crate `{}` on registry at {}",
                 name,
@@ -62,7 +65,10 @@ pub fn modify_owners(gctx: &GlobalContext, opts: &OwnersOptions) -> CargoResult<
         let v = v.iter().map(|s| &s[..]).collect::<Vec<_>>();
         gctx.shell()
             .status("Owner", format!("removing {:?} from crate {}", v, name))?;
-        registry.remove_owners(&name, &v).with_context(|| {
+        super::api_mfa::with_api_mfa_retry(gctx, &mut registry, |registry| {
+            registry.remove_owners(&name, &v)
+        })
+        .with_context(|| {
             format!(
                 "failed to remove owners from crate `{}` on registry at {}",
                 name,

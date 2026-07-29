@@ -32,6 +32,37 @@ If the response code indicates an error and the content does not have this struc
  message intended to help debugging the server error. A server returning an `errors` object allows a registry to provide a more
 detailed or user-centric error message.
 
+### Interactive MFA (`mfa_required`)
+
+Registries may require an interactive second factor for publish, yank, unyank,
+or owner changes. In that case the failure response should use status `403` and
+include additional fields on the error object:
+
+```javascript
+{
+    "errors": [
+        {
+            "detail": "API MFA required",
+            "id": "mfa_required",
+            "operation_id": "mfa_…",
+            "operation": "publish",
+            "crate": "example",
+            "verification_url": "https://example.com/mfa/verify/mfa_…",
+            "poll_url": "https://example.com/api/v1/mfa/challenges/mfa_…",
+            "expires_at": "2026-01-01T00:00:00Z",
+            "recommended_poll_interval_secs": 2
+        }
+    ]
+}
+```
+
+When Cargo sees `id: "mfa_required"` with `verification_url` and `poll_url`, it
+prints the verification URL, polls `poll_url` until the JSON response has
+`"status": "acknowledged"` (or `"acknowledged": true`), then retries the
+original request. Poll responses should also include
+`recommended_poll_interval_secs` when available. Missing or expired challenges
+should return `404`.
+
 For backwards compatibility, servers should ignore any unexpected query
 parameters or JSON fields. If a JSON field is missing, it should be assumed to
 be null. The endpoints are versioned with the `v1` component of the path, and

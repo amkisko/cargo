@@ -126,6 +126,41 @@ struct ApiErrorList {
 #[derive(Deserialize)]
 struct ApiError {
     detail: String,
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    verification_url: Option<String>,
+    #[serde(default)]
+    poll_url: Option<String>,
+    #[serde(default)]
+    recommended_poll_interval_secs: Option<u64>,
+    #[serde(default)]
+    expires_at: Option<String>,
+    #[serde(default)]
+    operation_id: Option<String>,
+}
+
+/// Registry response when a dangerous API call needs interactive MFA acknowledgment.
+///
+/// See the crates.io API MFA handshake (`errors[].id == "mfa_required"`).
+#[derive(Debug, Clone)]
+pub struct MfaRequired {
+    pub detail: String,
+    pub operation_id: Option<String>,
+    pub verification_url: String,
+    pub poll_url: String,
+    pub recommended_poll_interval_secs: Option<u64>,
+    pub expires_at: Option<String>,
+}
+
+/// Poll response body for `GET` of [`MfaRequired::poll_url`].
+#[derive(Debug, Deserialize)]
+pub struct MfaChallengeStatus {
+    pub status: String,
+    #[serde(default)]
+    pub acknowledged: bool,
+    #[serde(default)]
+    pub recommended_poll_interval_secs: Option<u64>,
 }
 #[derive(Serialize)]
 struct OwnersReq<'a> {
@@ -181,6 +216,13 @@ pub enum Error<T> {
         headers: Vec<String>,
         errors: Vec<String>,
     },
+
+    /// Registry requires interactive MFA (e.g. crates.io passkey step-up).
+    ///
+    /// The CLI should print [`MfaRequired::verification_url`], poll
+    /// [`MfaRequired::poll_url`] until acknowledged, then retry the request.
+    #[error("{}", .0.detail)]
+    MfaRequired(MfaRequired),
 
     /// Error from API response which didn't have pre-programmed `errors.details`.
     #[error(
@@ -386,6 +428,33 @@ impl<T: HttpClient> Registry<T> {
         Ok(())
     }
 
+    /// `GET` an absolute URL, optionally with the registry authorization token.
+    ///
+    /// Used to poll MFA challenge status URLs returned by the registry.
+    pub fn get_absolute(&mut self, url: &str) -> RegistryResult<String, T::Error> {
+        let mut request = http::Request::builder()
+            .method(Method::GET)
+            .uri(url)
+            .header(http::header::ACCEPT, "application/json");
+        if let Some(token) = self.token.as_deref() {
+            if check_token(token).is_ok() {
+                request = request.header(http::header::AUTHORIZATION, token);
+            }
+        }
+        let request = request.body(Vec::new())?;
+        let response = self.handle.request(request).map_err(Error::Transport)?;
+        self.handle(response)
+    }
+
+    /// Polls an MFA challenge until the registry reports `status == "acknowledged"`.
+    pub fn poll_mfa_challenge(
+        &mut self,
+        poll_url: &str,
+    ) -> RegistryResult<MfaChallengeStatus, T::Error> {
+        let body = self.get_absolute(poll_url)?;
+        Ok(serde_json::from_str(&body)?)
+    }
+
     fn put(&mut self, path: &str, b: Option<&[u8]>) -> RegistryResult<String, T::Error> {
         self.req(Method::PUT, path, b, Auth::Authorized)
     }
@@ -436,9 +505,7 @@ impl<T: HttpClient> Registry<T> {
     fn handle(&mut self, response: http::Response<Vec<u8>>) -> RegistryResult<String, T::Error> {
         let (head, body) = response.into_parts();
         let body = String::from_utf8(body)?;
-        let errors = serde_json::from_str::<ApiErrorList>(&body)
-            .ok()
-            .map(|s| s.errors.into_iter().map(|s| s.detail).collect::<Vec<_>>());
+        let api_errors = serde_json::from_str::<ApiErrorList>(&body).ok();
 
         let headers = head
             .headers
@@ -446,6 +513,19 @@ impl<T: HttpClient> Registry<T> {
             .filter_map(|(k, v)| Some((k, v.to_str().ok()?)))
             .map(|(k, v)| format!("{k}: {v}"))
             .collect();
+
+        if let Some(list) = &api_errors {
+            if let Some(mfa) = list.errors.iter().find_map(mfa_required_from_api_error) {
+                return Err(Error::MfaRequired(mfa));
+            }
+        }
+
+        let errors = api_errors.map(|s| {
+            s.errors
+                .into_iter()
+                .map(|s| s.detail)
+                .collect::<Vec<_>>()
+        });
 
         match (head.status, errors) {
             (code, None) if code.is_success() => Ok(body),
@@ -461,6 +541,22 @@ impl<T: HttpClient> Registry<T> {
             }),
         }
     }
+}
+
+fn mfa_required_from_api_error(err: &ApiError) -> Option<MfaRequired> {
+    if err.id.as_deref() != Some("mfa_required") {
+        return None;
+    }
+    let verification_url = err.verification_url.clone()?;
+    let poll_url = err.poll_url.clone()?;
+    Some(MfaRequired {
+        detail: err.detail.clone(),
+        operation_id: err.operation_id.clone(),
+        verification_url,
+        poll_url,
+        recommended_poll_interval_secs: err.recommended_poll_interval_secs,
+        expires_at: err.expires_at.clone(),
+    })
 }
 
 fn status(code: StatusCode) -> String {

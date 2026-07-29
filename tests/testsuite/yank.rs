@@ -1,10 +1,11 @@
 //! Tests for the `cargo yank` command.
 
 use std::fs;
+use std::sync::{Arc, Mutex};
 
 use crate::prelude::*;
 use cargo_test_support::project;
-use cargo_test_support::registry;
+use cargo_test_support::registry::{self, RegistryBuilder, Response};
 use cargo_test_support::str;
 
 fn setup(name: &str, version: &str) {
@@ -276,6 +277,75 @@ fn prefixed_v_in_version() {
 
 Caused by:
   unexpected character 'v' while parsing major version number
+
+"#]])
+        .run();
+}
+
+/// Registry returns `mfa_required`; Cargo polls until acknowledged, then retries yank.
+#[cargo_test]
+fn api_mfa_required_then_retry() {
+    let yank_count = Arc::new(Mutex::new(0u32));
+    let poll_count = Arc::new(Mutex::new(0u32));
+
+    let registry = RegistryBuilder::new()
+        .http_api()
+        .add_responder("/api/v1/crates/foo/0.0.1/yank", move |req, server| {
+            let mut n = yank_count.lock().unwrap();
+            *n += 1;
+            if *n == 1 {
+                let origin = req.url.origin().ascii_serialization();
+                let body = format!(
+                    r#"{{"errors":[{{"detail":"API MFA required","id":"mfa_required","operation_id":"mfa_yank","operation":"yank","crate":"foo","verification_url":"{origin}/mfa/verify/mfa_yank","poll_url":"{origin}/api/v1/mfa/challenges/mfa_yank","expires_at":"2099-01-01T00:00:00Z","recommended_poll_interval_secs":0}}]}}"#
+                );
+                Response {
+                    code: 403,
+                    headers: vec![],
+                    body: body.into_bytes(),
+                }
+            } else {
+                server.ok(req)
+            }
+        })
+        .add_responder("/api/v1/mfa/challenges/mfa_yank", move |_req, _server| {
+            let mut n = poll_count.lock().unwrap();
+            *n += 1;
+            let status = if *n == 1 { "pending" } else { "acknowledged" };
+            let acknowledged = status == "acknowledged";
+            let body = format!(
+                r#"{{"operation_id":"mfa_yank","status":"{status}","acknowledged":{acknowledged},"verified":{acknowledged},"operation":"yank","crate_name":"foo","expires_at":"2099-01-01T00:00:00Z","localhost_port":null,"recommended_poll_interval_secs":0}}"#
+            );
+            Response {
+                code: 200,
+                headers: vec![],
+                body: body.into_bytes(),
+            }
+        })
+        .build();
+
+    let p = project()
+        .file(
+            "Cargo.toml",
+            r#"
+                [package]
+                name = "foo"
+                version = "0.0.1"
+                authors = []
+                license = "MIT"
+                description = "foo"
+            "#,
+        )
+        .file("src/main.rs", "fn main() {}")
+        .build();
+
+    p.cargo("yank --version 0.0.1")
+        .replace_crates_io(registry.index_url())
+        .with_stderr_data(str![[r#"
+[UPDATING] crates.io index
+[YANK] foo@0.0.1
+[NOTE] API MFA required; complete passkey verification in your browser, then Cargo will retry
+[VERIFYING] please visit http://127.0.0.1:[..]/mfa/verify/mfa_yank
+[NOTE] API MFA acknowledged; retrying request
 
 "#]])
         .run();

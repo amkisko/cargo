@@ -664,7 +664,10 @@ fn transmit(
         return Ok(());
     }
 
-    let warnings = registry.publish(&new_crate, tarball).with_context(|| {
+    let warnings = super::api_mfa::with_api_mfa_retry(gctx, registry, |registry| {
+        registry.publish(&new_crate, tarball)
+    })
+    .with_context(|| {
         format!(
             "failed to publish {} v{} to registry at {}{}",
             pkg.name(),

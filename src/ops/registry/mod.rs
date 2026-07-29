@@ -2,6 +2,7 @@
 //!
 //! [1]: https://doc.rust-lang.org/nightly/cargo/reference/registry-web-api.html
 
+mod api_mfa;
 mod cargo_info;
 mod cargo_login;
 mod cargo_logout;
@@ -361,7 +362,7 @@ pub(crate) fn infer_registry(pkgs: &[&Package]) -> CargoResult<Option<RegistryOr
     }
 }
 
-struct RegistryClient<'gctx>(&'gctx http_async::Client);
+pub(crate) struct RegistryClient<'gctx>(&'gctx http_async::Client);
 
 impl<'gctx> crates_io::HttpClient for RegistryClient<'gctx> {
     type Error = http_async::Error;

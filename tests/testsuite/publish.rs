@@ -4913,3 +4913,82 @@ fn workspace_circular_publish_dependency_with_non_cycle_package() {
 "#]])
         .run();
 }
+
+/// Registry returns `mfa_required`; Cargo polls until acknowledged, then retries publish.
+#[cargo_test]
+fn api_mfa_required_then_retry() {
+    let publish_count = Arc::new(Mutex::new(0u32));
+    let poll_count = Arc::new(Mutex::new(0u32));
+
+    let _registry = RegistryBuilder::new()
+        .alternative()
+        .http_api()
+        .add_responder("/api/v1/crates/new", move |req, server| {
+            let mut n = publish_count.lock().unwrap();
+            *n += 1;
+            if *n == 1 {
+                let origin = req.url.origin().ascii_serialization();
+                let body = format!(
+                    r#"{{"errors":[{{"detail":"API MFA required","id":"mfa_required","operation_id":"mfa_testop","operation":"publish","crate":"foo","verification_url":"{origin}/mfa/verify/mfa_testop","poll_url":"{origin}/api/v1/mfa/challenges/mfa_testop","expires_at":"2099-01-01T00:00:00Z","recommended_poll_interval_secs":0}}]}}"#
+                );
+                Response {
+                    code: 403,
+                    headers: vec![],
+                    body: body.into_bytes(),
+                }
+            } else {
+                server.check_authorized_publish(req)
+            }
+        })
+        .add_responder("/api/v1/mfa/challenges/mfa_testop", move |_req, _server| {
+            let mut n = poll_count.lock().unwrap();
+            *n += 1;
+            let status = if *n == 1 { "pending" } else { "acknowledged" };
+            let acknowledged = status == "acknowledged";
+            let body = format!(
+                r#"{{"operation_id":"mfa_testop","status":"{status}","acknowledged":{acknowledged},"verified":{acknowledged},"operation":"publish","crate_name":"foo","expires_at":"2099-01-01T00:00:00Z","localhost_port":null,"recommended_poll_interval_secs":0}}"#
+            );
+            Response {
+                code: 200,
+                headers: vec![],
+                body: body.into_bytes(),
+            }
+        })
+        .build();
+
+    let p = project()
+        .file(
+            "Cargo.toml",
+            r#"
+                [package]
+                name = "foo"
+                version = "0.0.1"
+                edition = "2015"
+                authors = []
+                license = "MIT"
+                description = "foo"
+                documentation = "foo"
+                homepage = "foo"
+                repository = "foo"
+            "#,
+        )
+        .file("src/lib.rs", "")
+        .build();
+
+    p.cargo("publish --no-verify --registry alternative")
+        .with_stderr_data(str![[r#"
+[UPDATING] `alternative` index
+[PACKAGING] foo v0.0.1 ([..]foo)
+[PACKAGED] 4 files, [FILE_SIZE]B ([FILE_SIZE]B compressed)
+[UPLOADING] foo v0.0.1 ([..]foo)
+[NOTE] API MFA required; complete passkey verification in your browser, then Cargo will retry
+[VERIFYING] please visit http://127.0.0.1:[..]/mfa/verify/mfa_testop
+[NOTE] API MFA acknowledged; retrying request
+[UPLOADED] foo v0.0.1 to registry `alternative`
+[NOTE] waiting for foo v0.0.1 to be available at registry `alternative`
+[HELP] you may press ctrl-c to skip waiting; the crate should be available shortly
+[PUBLISHED] foo v0.0.1 at registry `alternative`
+
+"#]])
+        .run();
+}

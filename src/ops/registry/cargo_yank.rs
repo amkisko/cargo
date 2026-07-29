@@ -59,7 +59,10 @@ pub fn yank(
     let package_spec = format!("{}@{}", name, version);
     if undo {
         gctx.shell().status("Unyank", package_spec)?;
-        registry.unyank(&name, &version).with_context(|| {
+        super::api_mfa::with_api_mfa_retry(gctx, &mut registry, |registry| {
+            registry.unyank(&name, &version)
+        })
+        .with_context(|| {
             format!(
                 "failed to undo a yank from the registry at {}",
                 registry.host()
@@ -67,9 +70,10 @@ pub fn yank(
         })?;
     } else {
         gctx.shell().status("Yank", package_spec)?;
-        registry
-            .yank(&name, &version)
-            .with_context(|| format!("failed to yank from the registry at {}", registry.host()))?;
+        super::api_mfa::with_api_mfa_retry(gctx, &mut registry, |registry| {
+            registry.yank(&name, &version)
+        })
+        .with_context(|| format!("failed to yank from the registry at {}", registry.host()))?;
     }
 
     Ok(())
