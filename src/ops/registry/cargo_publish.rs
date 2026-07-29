@@ -664,8 +664,22 @@ fn transmit(
         return Ok(());
     }
 
+    // Build the upload body once so MFA handshake retries do not re-read the tarball.
+    let (body, tarball_len) = Registry::<RegistryClient<'_>>::prepare_publish_body(
+        &new_crate, tarball,
+    )
+    .with_context(|| {
+        format!(
+            "failed to prepare {} v{} for upload to registry at {}{}",
+            pkg.name(),
+            pkg.version(),
+            registry.host(),
+            workspace_context()
+        )
+    })?;
+
     let warnings = super::api_mfa::with_api_mfa_retry(gctx, registry, |registry| {
-        registry.publish(&new_crate, tarball)
+        registry.publish_body(&body, tarball_len)
     })
     .with_context(|| {
         format!(

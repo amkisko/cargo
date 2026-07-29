@@ -370,4 +370,11 @@ impl<'gctx> crates_io::HttpClient for RegistryClient<'gctx> {
     fn request(&self, req: http::Request<Vec<u8>>) -> Result<http::Response<Vec<u8>>, Self::Error> {
         self.0.request_blocking(req)
     }
+
+    fn request_no_redirect(
+        &self,
+        req: http::Request<Vec<u8>>,
+    ) -> Result<http::Response<Vec<u8>>, Self::Error> {
+        self.0.request_blocking_no_redirect(req)
+    }
 }

@@ -5007,6 +5007,70 @@ fn api_mfa_required_then_retry() {
     );
 }
 
+/// Cargo refuses HTTP redirects on MFA poll URLs (SSRF via Location).
+#[cargo_test]
+fn api_mfa_rejects_poll_redirect() {
+    let _registry = RegistryBuilder::new()
+        .alternative()
+        .http_api()
+        .add_responder("/api/v1/crates/new", |req, _server| {
+            let origin = req.url.origin().ascii_serialization();
+            let body = format!(
+                r#"{{"errors":[{{"detail":"API MFA required","id":"mfa_required","operation_id":"mfa_redir","operation":"publish","crate":"foo","verification_url":"{origin}/mfa/verify/mfa_redir","poll_url":"{origin}/api/v1/mfa/challenges/mfa_redir","expires_at":"2099-01-01T00:00:00Z","recommended_poll_interval_secs":1}}]}}"#
+            );
+            Response {
+                code: 403,
+                headers: vec![],
+                body: body.into_bytes(),
+            }
+        })
+        .add_responder(
+            "/api/v1/mfa/challenges/mfa_redir",
+            |_req, _server| Response {
+                code: 302,
+                headers: vec!["Location: http://127.0.0.1:9/".to_string()],
+                body: vec![],
+            },
+        )
+        .build();
+
+    let p = project()
+        .file(
+            "Cargo.toml",
+            r#"
+                [package]
+                name = "foo"
+                version = "0.0.1"
+                edition = "2015"
+                authors = []
+                license = "MIT"
+                description = "foo"
+                documentation = "foo"
+                homepage = "foo"
+                repository = "foo"
+            "#,
+        )
+        .file("src/lib.rs", "")
+        .build();
+
+    p.cargo("publish --no-verify --registry alternative")
+        .with_status(101)
+        .with_stderr_data(str![[r#"
+[UPDATING] `alternative` index
+[PACKAGING] foo v0.0.1 ([..]foo)
+[PACKAGED] 4 files, [FILE_SIZE]B ([FILE_SIZE]B compressed)
+[UPLOADING] foo v0.0.1 ([..]foo)
+[NOTE] API MFA required; complete verification in your browser, then Cargo will retry
+[VERIFYING] please visit http://127.0.0.1:[..]/mfa/verify/mfa_redir
+[ERROR] failed to publish foo v0.0.1 to registry at http://127.0.0.1:[..]/
+
+Caused by:
+  refusing to follow MFA poll redirect from `http://127.0.0.1:[..]/api/v1/mfa/challenges/mfa_redir` to `http://127.0.0.1:9/`
+
+"#]])
+        .run();
+}
+
 /// Cargo refuses MFA poll URLs that do not share the registry API origin.
 #[cargo_test]
 fn api_mfa_rejects_cross_origin_poll_url() {

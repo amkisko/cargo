@@ -98,7 +98,23 @@ impl Client {
     /// Perform a blocking HTTP request using this client.
     /// Does not start an async executor.
     pub fn request_blocking(&self, request: Request) -> HttpResult<Response> {
-        let mut handle = self.request_helper(request)?;
+        self.request_blocking_inner(request, true)
+    }
+
+    /// Blocking request that does not follow HTTP redirects.
+    ///
+    /// Used for registry MFA poll URLs so a same-origin `poll_url` cannot bounce
+    /// Cargo onto loopback or link-local addresses via `Location`.
+    pub fn request_blocking_no_redirect(&self, request: Request) -> HttpResult<Response> {
+        self.request_blocking_inner(request, false)
+    }
+
+    fn request_blocking_inner(
+        &self,
+        request: Request,
+        follow_redirects: bool,
+    ) -> HttpResult<Response> {
+        let mut handle = self.request_helper(request, follow_redirects)?;
         // Configure the handle timeout since we're blocking here and not using the
         // client-level timeout.
         self.handle_config.timeout.configure2(&mut handle)?;
@@ -108,7 +124,7 @@ impl Client {
 
     /// Perform an HTTP request using this client.
     pub async fn request(&self, request: Request) -> HttpResult<Response> {
-        let handle = self.request_helper(request)?;
+        let handle = self.request_helper(request, true)?;
         let (sender, receiver) = oneshot::channel();
         let req = Message {
             easy: handle,
@@ -118,7 +134,11 @@ impl Client {
         receiver.await.unwrap()
     }
 
-    fn request_helper(&self, request: Request) -> HttpResult<Easy2<Collector>> {
+    fn request_helper(
+        &self,
+        request: Request,
+        follow_redirects: bool,
+    ) -> HttpResult<Easy2<Collector>> {
         let url = request.uri().to_string();
         debug!(target: "network::fetch", url);
         let mut collector = Collector::new(self.stats.clone());
@@ -130,7 +150,7 @@ impl Client {
         self.handle_config.configure2(&mut handle)?;
 
         handle.url(&url)?;
-        handle.follow_location(true)?;
+        handle.follow_location(follow_redirects)?;
         handle.progress(true)?;
 
         match parts.method {

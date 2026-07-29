@@ -21,6 +21,16 @@ type RegistryResult<T, E> = Result<T, Error<E>>;
 pub trait HttpClient {
     type Error: std::error::Error + Send + Sync;
     fn request(&self, req: Request<Vec<u8>>) -> Result<Response<Vec<u8>>, Self::Error>;
+
+    /// Like [`Self::request`], but HTTP redirects must not be followed.
+    ///
+    /// Used for MFA challenge polls so a same-origin `poll_url` cannot redirect
+    /// the client to loopback or other internal addresses. The default
+    /// implementation calls [`Self::request`]; production clients should override
+    /// this to disable redirect following.
+    fn request_no_redirect(&self, req: Request<Vec<u8>>) -> Result<Response<Vec<u8>>, Self::Error> {
+        self.request(req)
+    }
 }
 
 pub struct Registry<T: HttpClient> {
@@ -237,6 +247,17 @@ pub enum Error<T> {
         registry_host: String,
     },
 
+    /// MFA poll responded with an HTTP redirect.
+    ///
+    /// Poll requests do not follow redirects so a malicious registry cannot
+    /// bounce the client onto loopback or link-local addresses after the
+    /// same-origin check passes.
+    #[error("refusing to follow MFA poll redirect from `{poll_url}`")]
+    InvalidMfaPollRedirect {
+        poll_url: String,
+        location: Option<String>,
+    },
+
     /// Error from API response which didn't have pre-programmed `errors.details`.
     #[error(
         "failed to get a 200 OK response, got {}\nheaders:\n\t{}\nbody:\n{body}",
@@ -329,11 +350,14 @@ impl<T: HttpClient> Registry<T> {
         Ok(serde_json::from_str::<Users>(&body)?.users)
     }
 
-    pub fn publish(
-        &mut self,
+    /// Builds the `/crates/new` request body (crate metadata + tarball).
+    ///
+    /// Callers that may retry the upload (for example after an MFA handshake)
+    /// should build the body once and pass it to [`Self::publish_body`].
+    pub fn prepare_publish_body(
         krate: &NewCrate,
         mut tarball: &File,
-    ) -> RegistryResult<Warnings, T::Error> {
+    ) -> RegistryResult<(Vec<u8>, u64), T::Error> {
         let json = serde_json::to_string(krate)?;
         // Prepare the body. The format of the upload request is:
         //
@@ -358,13 +382,22 @@ impl<T: HttpClient> Registry<T> {
         };
         let mut body = Vec::new();
         Cursor::new(header).chain(tarball).read_to_end(&mut body)?;
+        Ok((body, tarball_len))
+    }
+
+    /// Uploads a body previously built by [`Self::prepare_publish_body`].
+    pub fn publish_body(
+        &mut self,
+        body: &[u8],
+        tarball_len: u64,
+    ) -> RegistryResult<Warnings, T::Error> {
         let url = self.api_url("/crates/new");
 
         let request = http::Request::put(url)
             .header(http::header::CONTENT_TYPE, "application/octet-stream")
             .header(http::header::ACCEPT, "application/json")
             .header(http::header::AUTHORIZATION, self.token()?)
-            .body(body)?;
+            .body(body.to_vec())?;
         let started = Instant::now();
         let response = self.handle.request(request).map_err(Error::Transport)?;
         let body = self.handle(response).map_err(|e| match e {
@@ -412,6 +445,15 @@ impl<T: HttpClient> Registry<T> {
         })
     }
 
+    pub fn publish(
+        &mut self,
+        krate: &NewCrate,
+        tarball: &File,
+    ) -> RegistryResult<Warnings, T::Error> {
+        let (body, tarball_len) = Self::prepare_publish_body(krate, tarball)?;
+        self.publish_body(&body, tarball_len)
+    }
+
     pub fn search(
         &mut self,
         query: &str,
@@ -441,27 +483,10 @@ impl<T: HttpClient> Registry<T> {
         Ok(())
     }
 
-    /// `GET` an absolute URL, optionally with the registry authorization token.
-    ///
-    /// Used to poll MFA challenge status URLs returned by the registry.
-    pub fn get_absolute(&mut self, url: &str) -> RegistryResult<String, T::Error> {
-        let mut request = http::Request::builder()
-            .method(Method::GET)
-            .uri(url)
-            .header(http::header::ACCEPT, "application/json");
-        if let Some(token) = self.token.as_deref() {
-            if check_token(token).is_ok() {
-                request = request.header(http::header::AUTHORIZATION, token);
-            }
-        }
-        let request = request.body(Vec::new())?;
-        let response = self.handle.request(request).map_err(Error::Transport)?;
-        self.handle(response)
-    }
-
     /// Polls an MFA challenge status endpoint.
     ///
-    /// `poll_url` must share scheme/host/port with [`Registry::host`].
+    /// `poll_url` must share scheme/host/port with [`Registry::host`]. Redirects
+    /// are not followed.
     pub fn poll_mfa_challenge(
         &mut self,
         poll_url: &str,
@@ -472,7 +497,35 @@ impl<T: HttpClient> Registry<T> {
                 registry_host: self.host.clone(),
             });
         }
-        let body = self.get_absolute(poll_url)?;
+
+        let mut request = http::Request::builder()
+            .method(Method::GET)
+            .uri(poll_url)
+            .header(http::header::ACCEPT, "application/json");
+        if let Some(token) = self.token.as_deref() {
+            if check_token(token).is_ok() {
+                request = request.header(http::header::AUTHORIZATION, token);
+            }
+        }
+        let request = request.body(Vec::new())?;
+        let response = self
+            .handle
+            .request_no_redirect(request)
+            .map_err(Error::Transport)?;
+
+        if response.status().is_redirection() {
+            let location = response
+                .headers()
+                .get(http::header::LOCATION)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned);
+            return Err(Error::InvalidMfaPollRedirect {
+                poll_url: poll_url.to_owned(),
+                location,
+            });
+        }
+
+        let body = self.handle(response)?;
         Ok(serde_json::from_str(&body)?)
     }
 

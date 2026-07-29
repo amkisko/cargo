@@ -61,9 +61,9 @@ When Cargo sees a non-success response with `id: "mfa_required"` and both
 `poll_url` until the JSON response has `"status": "acknowledged"` (or
 `"acknowledged": true`), then retries the original request. `poll_url` must use
 the same origin (scheme, host, and port) as the registry API host from
-`config.json`; Cargo refuses cross-origin poll URLs. Cargo clamps
-`recommended_poll_interval_secs` to between 1 and 30 seconds. Missing or
-expired challenges should return `404`.
+`config.json`; Cargo refuses cross-origin poll URLs and does not follow HTTP
+redirects on poll requests. Cargo clamps `recommended_poll_interval_secs` to
+between 1 and 30 seconds. Missing or expired challenges should return `404`.
 
 For backwards compatibility, servers should ignore any unexpected query
 parameters or JSON fields. If a JSON field is missing, it should be assumed to

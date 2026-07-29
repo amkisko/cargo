@@ -122,6 +122,15 @@ fn wait_for_api_mfa(
                      URL must use the same origin as the registry API ({registry_host})"
                 );
             }
+            Err(RegistryError::InvalidMfaPollRedirect { poll_url, location }) => {
+                bail!(
+                    "refusing to follow MFA poll redirect from `{poll_url}`{}",
+                    match location {
+                        Some(loc) => format!(" to `{loc}`"),
+                        None => String::new(),
+                    }
+                );
+            }
             Err(RegistryError::Code { code, .. }) | Err(RegistryError::Api { code, .. })
                 if code.as_u16() == 404 =>
             {
