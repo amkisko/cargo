@@ -296,7 +296,7 @@ fn api_mfa_required_then_retry() {
             if *n == 1 {
                 let origin = req.url.origin().ascii_serialization();
                 let body = format!(
-                    r#"{{"errors":[{{"detail":"API MFA required","id":"mfa_required","operation_id":"mfa_yank","operation":"yank","crate":"foo","verification_url":"{origin}/mfa/verify/mfa_yank","poll_url":"{origin}/api/v1/mfa/challenges/mfa_yank","expires_at":"2099-01-01T00:00:00Z","recommended_poll_interval_secs":0}}]}}"#
+                    r#"{{"errors":[{{"detail":"API MFA required","id":"mfa_required","operation_id":"mfa_yank","operation":"yank","crate":"foo","verification_url":"{origin}/mfa/verify/mfa_yank","poll_url":"{origin}/api/v1/mfa/challenges/mfa_yank","expires_at":"2099-01-01T00:00:00Z","recommended_poll_interval_secs":1}}]}}"#
                 );
                 Response {
                     code: 403,
@@ -313,7 +313,7 @@ fn api_mfa_required_then_retry() {
             let status = if *n == 1 { "pending" } else { "acknowledged" };
             let acknowledged = status == "acknowledged";
             let body = format!(
-                r#"{{"operation_id":"mfa_yank","status":"{status}","acknowledged":{acknowledged},"verified":{acknowledged},"operation":"yank","crate_name":"foo","expires_at":"2099-01-01T00:00:00Z","localhost_port":null,"recommended_poll_interval_secs":0}}"#
+                r#"{{"operation_id":"mfa_yank","status":"{status}","acknowledged":{acknowledged},"verified":{acknowledged},"operation":"yank","crate_name":"foo","expires_at":"2099-01-01T00:00:00Z","localhost_port":null,"recommended_poll_interval_secs":1}}"#
             );
             Response {
                 code: 200,
@@ -343,7 +343,7 @@ fn api_mfa_required_then_retry() {
         .with_stderr_data(str![[r#"
 [UPDATING] crates.io index
 [YANK] foo@0.0.1
-[NOTE] API MFA required; complete passkey verification in your browser, then Cargo will retry
+[NOTE] API MFA required; complete verification in your browser, then Cargo will retry
 [VERIFYING] please visit http://127.0.0.1:[..]/mfa/verify/mfa_yank
 [NOTE] API MFA acknowledged; retrying request
 

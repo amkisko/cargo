@@ -56,12 +56,14 @@ include additional fields on the error object:
 }
 ```
 
-When Cargo sees `id: "mfa_required"` with `verification_url` and `poll_url`, it
-prints the verification URL, polls `poll_url` until the JSON response has
-`"status": "acknowledged"` (or `"acknowledged": true`), then retries the
-original request. Poll responses should also include
-`recommended_poll_interval_secs` when available. Missing or expired challenges
-should return `404`.
+When Cargo sees a non-success response with `id: "mfa_required"` and both
+`verification_url` and `poll_url`, it prints the verification URL, polls
+`poll_url` until the JSON response has `"status": "acknowledged"` (or
+`"acknowledged": true`), then retries the original request. `poll_url` must use
+the same origin (scheme, host, and port) as the registry API host from
+`config.json`; Cargo refuses cross-origin poll URLs. Poll no faster than
+`recommended_poll_interval_secs` (Cargo clamps to at least one second). Missing
+or expired challenges should return `404`.
 
 For backwards compatibility, servers should ignore any unexpected query
 parameters or JSON fields. If a JSON field is missing, it should be assumed to

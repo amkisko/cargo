@@ -224,6 +224,19 @@ pub enum Error<T> {
     #[error("{}", .0.detail)]
     MfaRequired(MfaRequired),
 
+    /// `poll_url` from an MFA challenge did not share the registry API origin.
+    ///
+    /// Cargo refuses to follow cross-origin poll URLs to avoid SSRF from a
+    /// malicious registry response.
+    #[error(
+        "refusing to poll MFA status at `{poll_url}`; \
+         URL must use the same origin as the registry API ({registry_host})"
+    )]
+    InvalidMfaPollUrl {
+        poll_url: String,
+        registry_host: String,
+    },
+
     /// Error from API response which didn't have pre-programmed `errors.details`.
     #[error(
         "failed to get a 200 OK response, got {}\nheaders:\n\t{}\nbody:\n{body}",
@@ -446,11 +459,19 @@ impl<T: HttpClient> Registry<T> {
         self.handle(response)
     }
 
-    /// Polls an MFA challenge until the registry reports `status == "acknowledged"`.
+    /// Polls an MFA challenge status endpoint.
+    ///
+    /// `poll_url` must share scheme/host/port with [`Registry::host`].
     pub fn poll_mfa_challenge(
         &mut self,
         poll_url: &str,
     ) -> RegistryResult<MfaChallengeStatus, T::Error> {
+        if !url_shares_origin_with_registry(poll_url, &self.host) {
+            return Err(Error::InvalidMfaPollUrl {
+                poll_url: poll_url.to_owned(),
+                registry_host: self.host.clone(),
+            });
+        }
         let body = self.get_absolute(poll_url)?;
         Ok(serde_json::from_str(&body)?)
     }
@@ -514,9 +535,13 @@ impl<T: HttpClient> Registry<T> {
             .map(|(k, v)| format!("{k}: {v}"))
             .collect();
 
-        if let Some(list) = &api_errors {
-            if let Some(mfa) = list.errors.iter().find_map(mfa_required_from_api_error) {
-                return Err(Error::MfaRequired(mfa));
+        // Only treat MFA on error responses. A 2xx body must not trigger a handshake
+        // even if it happens to contain similar JSON fields.
+        if !head.status.is_success() {
+            if let Some(list) = &api_errors {
+                if let Some(mfa) = list.errors.iter().find_map(mfa_required_from_api_error) {
+                    return Err(Error::MfaRequired(mfa));
+                }
             }
         }
 
@@ -557,6 +582,19 @@ fn mfa_required_from_api_error(err: &ApiError) -> Option<MfaRequired> {
         recommended_poll_interval_secs: err.recommended_poll_interval_secs,
         expires_at: err.expires_at.clone(),
     })
+}
+
+/// Returns true when `url` shares scheme, host, and port with `registry_host`.
+pub fn url_shares_origin_with_registry(url: &str, registry_host: &str) -> bool {
+    let Ok(url) = Url::parse(url) else {
+        return false;
+    };
+    let Ok(host) = Url::parse(registry_host) else {
+        return false;
+    };
+    url.scheme() == host.scheme()
+        && url.host() == host.host()
+        && url.port_or_known_default() == host.port_or_known_default()
 }
 
 fn status(code: StatusCode) -> String {
@@ -608,5 +646,39 @@ pub fn check_token(token: &str) -> Result<(), TokenError> {
         Ok(())
     } else {
         Err(TokenError::InvalidCharacters)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::url_shares_origin_with_registry;
+
+    #[test]
+    fn mfa_poll_url_same_origin() {
+        assert!(url_shares_origin_with_registry(
+            "https://crates.io/api/v1/mfa/challenges/mfa_x",
+            "https://crates.io",
+        ));
+        assert!(url_shares_origin_with_registry(
+            "http://127.0.0.1:1234/api/v1/mfa/challenges/mfa_x",
+            "http://127.0.0.1:1234",
+        ));
+    }
+
+    #[test]
+    fn mfa_poll_url_rejects_cross_origin() {
+        assert!(!url_shares_origin_with_registry(
+            "http://127.0.0.1:9/secret",
+            "https://crates.io",
+        ));
+        assert!(!url_shares_origin_with_registry(
+            "https://evil.example/api/v1/mfa/challenges/mfa_x",
+            "https://crates.io",
+        ));
+        assert!(!url_shares_origin_with_registry(
+            "https://crates.io:443/api/v1/mfa/challenges/mfa_x",
+            "http://crates.io",
+        ));
+        assert!(!url_shares_origin_with_registry("not a url", "https://crates.io"));
     }
 }

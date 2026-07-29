@@ -1,10 +1,11 @@
 //! Tests for the `cargo owner` command.
 
 use std::fs;
+use std::sync::{Arc, Mutex};
 
 use crate::prelude::*;
 use cargo_test_support::project;
-use cargo_test_support::registry::{self, api_path};
+use cargo_test_support::registry::{self, api_path, RegistryBuilder, Response};
 use cargo_test_support::str;
 
 fn setup(name: &str, content: Option<&str>) {
@@ -190,5 +191,77 @@ fn simple_remove_with_asymmetric() {
         .replace_crates_io(registry.index_url())
         .masquerade_as_nightly_cargo(&["asymmetric-token"])
         .with_status(0)
+        .run();
+}
+
+/// Registry returns `mfa_required`; Cargo polls until acknowledged, then retries owner add.
+#[cargo_test]
+fn api_mfa_required_then_retry() {
+    let owner_count = Arc::new(Mutex::new(0u32));
+    let poll_count = Arc::new(Mutex::new(0u32));
+
+    let registry = RegistryBuilder::new()
+        .http_api()
+        .add_responder("/api/v1/crates/foo/owners", move |req, server| {
+            if req.method != "put" {
+                return server.ok(req);
+            }
+            let mut n = owner_count.lock().unwrap();
+            *n += 1;
+            if *n == 1 {
+                let origin = req.url.origin().ascii_serialization();
+                let body = format!(
+                    r#"{{"errors":[{{"detail":"API MFA required","id":"mfa_required","operation_id":"mfa_owners","operation":"change-owners","crate":"foo","verification_url":"{origin}/mfa/verify/mfa_owners","poll_url":"{origin}/api/v1/mfa/challenges/mfa_owners","expires_at":"2099-01-01T00:00:00Z","recommended_poll_interval_secs":1}}]}}"#
+                );
+                Response {
+                    code: 403,
+                    headers: vec![],
+                    body: body.into_bytes(),
+                }
+            } else {
+                server.ok(req)
+            }
+        })
+        .add_responder("/api/v1/mfa/challenges/mfa_owners", move |_req, _server| {
+            let mut n = poll_count.lock().unwrap();
+            *n += 1;
+            let status = if *n == 1 { "pending" } else { "acknowledged" };
+            let acknowledged = status == "acknowledged";
+            let body = format!(
+                r#"{{"operation_id":"mfa_owners","status":"{status}","acknowledged":{acknowledged},"verified":{acknowledged},"operation":"change-owners","crate_name":"foo","expires_at":"2099-01-01T00:00:00Z","localhost_port":null,"recommended_poll_interval_secs":1}}"#
+            );
+            Response {
+                code: 200,
+                headers: vec![],
+                body: body.into_bytes(),
+            }
+        })
+        .build();
+
+    let p = project()
+        .file(
+            "Cargo.toml",
+            r#"
+                [package]
+                name = "foo"
+                version = "0.0.1"
+                authors = []
+                license = "MIT"
+                description = "foo"
+            "#,
+        )
+        .file("src/main.rs", "fn main() {}")
+        .build();
+
+    p.cargo("owner -a username")
+        .replace_crates_io(registry.index_url())
+        .with_stderr_data(str![[r#"
+[UPDATING] crates.io index
+[NOTE] API MFA required; complete verification in your browser, then Cargo will retry
+[VERIFYING] please visit http://127.0.0.1:[..]/mfa/verify/mfa_owners
+[NOTE] API MFA acknowledged; retrying request
+[OWNER] completed!
+
+"#]])
         .run();
 }

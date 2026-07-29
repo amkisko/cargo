@@ -4919,6 +4919,8 @@ fn workspace_circular_publish_dependency_with_non_cycle_package() {
 fn api_mfa_required_then_retry() {
     let publish_count = Arc::new(Mutex::new(0u32));
     let poll_count = Arc::new(Mutex::new(0u32));
+    let poll_auths = Arc::new(Mutex::new(Vec::new()));
+    let poll_auths2 = poll_auths.clone();
 
     let _registry = RegistryBuilder::new()
         .alternative()
@@ -4929,7 +4931,7 @@ fn api_mfa_required_then_retry() {
             if *n == 1 {
                 let origin = req.url.origin().ascii_serialization();
                 let body = format!(
-                    r#"{{"errors":[{{"detail":"API MFA required","id":"mfa_required","operation_id":"mfa_testop","operation":"publish","crate":"foo","verification_url":"{origin}/mfa/verify/mfa_testop","poll_url":"{origin}/api/v1/mfa/challenges/mfa_testop","expires_at":"2099-01-01T00:00:00Z","recommended_poll_interval_secs":0}}]}}"#
+                    r#"{{"errors":[{{"detail":"API MFA required","id":"mfa_required","operation_id":"mfa_testop","operation":"publish","crate":"foo","verification_url":"{origin}/mfa/verify/mfa_testop","poll_url":"{origin}/api/v1/mfa/challenges/mfa_testop","expires_at":"2099-01-01T00:00:00Z","recommended_poll_interval_secs":1}}]}}"#
                 );
                 Response {
                     code: 403,
@@ -4940,13 +4942,17 @@ fn api_mfa_required_then_retry() {
                 server.check_authorized_publish(req)
             }
         })
-        .add_responder("/api/v1/mfa/challenges/mfa_testop", move |_req, _server| {
+        .add_responder("/api/v1/mfa/challenges/mfa_testop", move |req, _server| {
+            poll_auths
+                .lock()
+                .unwrap()
+                .push(req.authorization.clone());
             let mut n = poll_count.lock().unwrap();
             *n += 1;
             let status = if *n == 1 { "pending" } else { "acknowledged" };
             let acknowledged = status == "acknowledged";
             let body = format!(
-                r#"{{"operation_id":"mfa_testop","status":"{status}","acknowledged":{acknowledged},"verified":{acknowledged},"operation":"publish","crate_name":"foo","expires_at":"2099-01-01T00:00:00Z","localhost_port":null,"recommended_poll_interval_secs":0}}"#
+                r#"{{"operation_id":"mfa_testop","status":"{status}","acknowledged":{acknowledged},"verified":{acknowledged},"operation":"publish","crate_name":"foo","expires_at":"2099-01-01T00:00:00Z","localhost_port":null,"recommended_poll_interval_secs":1}}"#
             );
             Response {
                 code: 200,
@@ -4981,13 +4987,136 @@ fn api_mfa_required_then_retry() {
 [PACKAGING] foo v0.0.1 ([..]foo)
 [PACKAGED] 4 files, [FILE_SIZE]B ([FILE_SIZE]B compressed)
 [UPLOADING] foo v0.0.1 ([..]foo)
-[NOTE] API MFA required; complete passkey verification in your browser, then Cargo will retry
+[NOTE] API MFA required; complete verification in your browser, then Cargo will retry
 [VERIFYING] please visit http://127.0.0.1:[..]/mfa/verify/mfa_testop
 [NOTE] API MFA acknowledged; retrying request
 [UPLOADED] foo v0.0.1 to registry `alternative`
 [NOTE] waiting for foo v0.0.1 to be available at registry `alternative`
 [HELP] you may press ctrl-c to skip waiting; the crate should be available shortly
 [PUBLISHED] foo v0.0.1 at registry `alternative`
+
+"#]])
+        .run();
+
+    let auths = poll_auths2.lock().unwrap();
+    assert!(
+        auths.iter().all(|a| a.as_ref().is_some_and(|t| !t.is_empty())),
+        "MFA poll requests should include Authorization: {auths:?}"
+    );
+}
+
+/// Cargo refuses MFA poll URLs that do not share the registry API origin.
+#[cargo_test]
+fn api_mfa_rejects_cross_origin_poll_url() {
+    let _registry = RegistryBuilder::new()
+        .alternative()
+        .http_api()
+        .add_responder("/api/v1/crates/new", |req, _server| {
+            let origin = req.url.origin().ascii_serialization();
+            let body = format!(
+                r#"{{"errors":[{{"detail":"API MFA required","id":"mfa_required","operation_id":"mfa_evil","operation":"publish","crate":"foo","verification_url":"{origin}/mfa/verify/mfa_evil","poll_url":"http://127.0.0.1:9/evil","expires_at":"2099-01-01T00:00:00Z","recommended_poll_interval_secs":1}}]}}"#
+            );
+            Response {
+                code: 403,
+                headers: vec![],
+                body: body.into_bytes(),
+            }
+        })
+        .build();
+
+    let p = project()
+        .file(
+            "Cargo.toml",
+            r#"
+                [package]
+                name = "foo"
+                version = "0.0.1"
+                edition = "2015"
+                authors = []
+                license = "MIT"
+                description = "foo"
+                documentation = "foo"
+                homepage = "foo"
+                repository = "foo"
+            "#,
+        )
+        .file("src/lib.rs", "")
+        .build();
+
+    p.cargo("publish --no-verify --registry alternative")
+        .with_status(101)
+        .with_stderr_data(str![[r#"
+[UPDATING] `alternative` index
+[PACKAGING] foo v0.0.1 ([..]foo)
+[PACKAGED] 4 files, [FILE_SIZE]B ([FILE_SIZE]B compressed)
+[UPLOADING] foo v0.0.1 ([..]foo)
+[NOTE] API MFA required; complete verification in your browser, then Cargo will retry
+[VERIFYING] please visit http://127.0.0.1:[..]/mfa/verify/mfa_evil
+[ERROR] failed to publish foo v0.0.1 to registry at http://127.0.0.1:[..]/
+
+Caused by:
+  refusing to poll MFA status at `http://127.0.0.1:9/evil`; URL must use the same origin as the registry API (http://127.0.0.1:[..])
+
+"#]])
+        .run();
+}
+
+/// Expired/missing MFA challenge (poll 404) fails with an actionable error.
+#[cargo_test]
+fn api_mfa_poll_not_found() {
+    let _registry = RegistryBuilder::new()
+        .alternative()
+        .http_api()
+        .add_responder("/api/v1/crates/new", |req, _server| {
+            let origin = req.url.origin().ascii_serialization();
+            let body = format!(
+                r#"{{"errors":[{{"detail":"API MFA required","id":"mfa_required","operation_id":"mfa_gone","operation":"publish","crate":"foo","verification_url":"{origin}/mfa/verify/mfa_gone","poll_url":"{origin}/api/v1/mfa/challenges/mfa_gone","expires_at":"2099-01-01T00:00:00Z","recommended_poll_interval_secs":1}}]}}"#
+            );
+            Response {
+                code: 403,
+                headers: vec![],
+                body: body.into_bytes(),
+            }
+        })
+        .add_responder("/api/v1/mfa/challenges/mfa_gone", |_req, _server| Response {
+            code: 404,
+            headers: vec![],
+            body: br#"{"errors":[{"detail":"not found"}]}"#.to_vec(),
+        })
+        .build();
+
+    let p = project()
+        .file(
+            "Cargo.toml",
+            r#"
+                [package]
+                name = "foo"
+                version = "0.0.1"
+                edition = "2015"
+                authors = []
+                license = "MIT"
+                description = "foo"
+                documentation = "foo"
+                homepage = "foo"
+                repository = "foo"
+            "#,
+        )
+        .file("src/lib.rs", "")
+        .build();
+
+    p.cargo("publish --no-verify --registry alternative")
+        .with_status(101)
+        .with_stderr_data(str![[r#"
+[UPDATING] `alternative` index
+[PACKAGING] foo v0.0.1 ([..]foo)
+[PACKAGED] 4 files, [FILE_SIZE]B ([FILE_SIZE]B compressed)
+[UPLOADING] foo v0.0.1 ([..]foo)
+[NOTE] API MFA required; complete verification in your browser, then Cargo will retry
+[VERIFYING] please visit http://127.0.0.1:[..]/mfa/verify/mfa_gone
+[ERROR] failed to publish foo v0.0.1 to registry at http://127.0.0.1:[..]/
+
+Caused by:
+  API MFA challenge expired or was not found; visit http://127.0.0.1:[..]/mfa/verify/mfa_gone and retry the original command
 
 "#]])
         .run();
