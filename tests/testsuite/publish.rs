@@ -4934,7 +4934,8 @@ fn api_mfa_required_then_retry() {
                     r#"{{"errors":[{{"detail":"API MFA required","id":"mfa_required","operation_id":"mfa_testop","operation":"publish","crate":"foo","verification_url":"{origin}/mfa/verify/mfa_testop","poll_url":"{origin}/api/v1/mfa/challenges/mfa_testop","expires_at":"2099-01-01T00:00:00Z","recommended_poll_interval_secs":1}}]}}"#
                 );
                 Response {
-                    code: 403,
+                    // crates.io compatibility middleware rewrites this error to 200.
+                    code: 200,
                     headers: vec![],
                     body: body.into_bytes(),
                 }
@@ -4982,13 +4983,14 @@ fn api_mfa_required_then_retry() {
         .build();
 
     p.cargo("publish --no-verify --registry alternative")
+        .env("CARGO_API_MFA_INTERACTIVE", "1")
         .with_stderr_data(str![[r#"
 [UPDATING] `alternative` index
 [PACKAGING] foo v0.0.1 ([..]foo)
 [PACKAGED] 4 files, [FILE_SIZE]B ([FILE_SIZE]B compressed)
 [UPLOADING] foo v0.0.1 ([..]foo)
 [NOTE] API MFA required; complete verification in your browser, then Cargo will retry
-[VERIFYING] please visit http://127.0.0.1:[..]/mfa/verify/mfa_testop
+[VERIFYING] please visit http://127.0.0.1:[..]/mfa/verify/mfa_testop (publish foo)
 [NOTE] API MFA acknowledged; retrying request
 [UPLOADED] foo v0.0.1 to registry `alternative`
 [NOTE] waiting for foo v0.0.1 to be available at registry `alternative`
@@ -5054,6 +5056,7 @@ fn api_mfa_rejects_poll_redirect() {
         .build();
 
     p.cargo("publish --no-verify --registry alternative")
+        .env("CARGO_API_MFA_INTERACTIVE", "1")
         .with_status(101)
         .with_stderr_data(str![[r#"
 [UPDATING] `alternative` index
@@ -5061,7 +5064,7 @@ fn api_mfa_rejects_poll_redirect() {
 [PACKAGED] 4 files, [FILE_SIZE]B ([FILE_SIZE]B compressed)
 [UPLOADING] foo v0.0.1 ([..]foo)
 [NOTE] API MFA required; complete verification in your browser, then Cargo will retry
-[VERIFYING] please visit http://127.0.0.1:[..]/mfa/verify/mfa_redir
+[VERIFYING] please visit http://127.0.0.1:[..]/mfa/verify/mfa_redir (publish foo)
 [ERROR] failed to publish foo v0.0.1 to registry at http://127.0.0.1:[..]/
 
 Caused by:
@@ -5110,6 +5113,7 @@ fn api_mfa_rejects_cross_origin_poll_url() {
         .build();
 
     p.cargo("publish --no-verify --registry alternative")
+        .env("CARGO_API_MFA_INTERACTIVE", "1")
         .with_status(101)
         .with_stderr_data(str![[r#"
 [UPDATING] `alternative` index
@@ -5117,7 +5121,7 @@ fn api_mfa_rejects_cross_origin_poll_url() {
 [PACKAGED] 4 files, [FILE_SIZE]B ([FILE_SIZE]B compressed)
 [UPLOADING] foo v0.0.1 ([..]foo)
 [NOTE] API MFA required; complete verification in your browser, then Cargo will retry
-[VERIFYING] please visit http://127.0.0.1:[..]/mfa/verify/mfa_evil
+[VERIFYING] please visit http://127.0.0.1:[..]/mfa/verify/mfa_evil (publish foo)
 [ERROR] failed to publish foo v0.0.1 to registry at http://127.0.0.1:[..]/
 
 Caused by:
@@ -5171,6 +5175,7 @@ fn api_mfa_poll_not_found() {
         .build();
 
     p.cargo("publish --no-verify --registry alternative")
+        .env("CARGO_API_MFA_INTERACTIVE", "1")
         .with_status(101)
         .with_stderr_data(str![[r#"
 [UPDATING] `alternative` index
@@ -5178,11 +5183,186 @@ fn api_mfa_poll_not_found() {
 [PACKAGED] 4 files, [FILE_SIZE]B ([FILE_SIZE]B compressed)
 [UPLOADING] foo v0.0.1 ([..]foo)
 [NOTE] API MFA required; complete verification in your browser, then Cargo will retry
-[VERIFYING] please visit http://127.0.0.1:[..]/mfa/verify/mfa_gone
+[VERIFYING] please visit http://127.0.0.1:[..]/mfa/verify/mfa_gone (publish foo)
 [ERROR] failed to publish foo v0.0.1 to registry at http://127.0.0.1:[..]/
 
 Caused by:
   API MFA challenge expired or was not found; visit http://127.0.0.1:[..]/mfa/verify/mfa_gone and retry the original command
+
+"#]])
+        .run();
+}
+
+/// Registry returns `mfa_required`; Cargo listens on localhost, receives OTP, retries with `Crates-OTP`.
+#[cargo_test]
+fn api_mfa_localhost_otp_then_retry() {
+    let publish_count = Arc::new(Mutex::new(0u32));
+    let seen_port = Arc::new(Mutex::new(None::<u16>));
+    let seen_callback_secret = Arc::new(Mutex::new(None::<String>));
+    let seen_otp = Arc::new(Mutex::new(None::<String>));
+    let seen_port2 = seen_port.clone();
+    let seen_callback_secret2 = seen_callback_secret.clone();
+    let seen_otp2 = seen_otp.clone();
+
+    let _registry = RegistryBuilder::new()
+        .alternative()
+        .http_api()
+        .add_responder("/api/v1/crates/new", move |req, server| {
+            let mut n = publish_count.lock().unwrap();
+            *n += 1;
+            if *n == 1 {
+                let port = req
+                    .crates_mfa_port
+                    .as_deref()
+                    .and_then(|p| p.parse::<u16>().ok())
+                    .expect("first publish should send Crates-MFA-Port");
+                *seen_port.lock().unwrap() = Some(port);
+                let callback_secret = req
+                    .crates_mfa_callback_secret
+                    .clone()
+                    .expect("first publish should send Crates-MFA-Callback-Secret");
+                assert_eq!(callback_secret.len(), 32);
+                *seen_callback_secret.lock().unwrap() = Some(callback_secret);
+                // Simulate the verify page hitting `/?code=` on cargo's listener.
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                    if let Ok(mut stream) = std::net::TcpStream::connect(("127.0.0.1", port)) {
+                        use std::io::Write;
+                        let _ = write!(
+                            stream,
+                            "GET /?code=TestOtp1 HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
+                        );
+                    }
+                });
+                let origin = req.url.origin().ascii_serialization();
+                let body = format!(
+                    r#"{{"errors":[{{"detail":"API MFA required","id":"mfa_required","operation_id":"mfa_otp","operation":"publish","crate":"foo","verification_url":"{origin}/mfa/verify/mfa_otp","poll_url":"{origin}/api/v1/mfa/challenges/mfa_otp","expires_at":"2099-01-01T00:00:00Z","recommended_poll_interval_secs":1}}]}}"#
+                );
+                Response {
+                    code: 403,
+                    headers: vec![],
+                    body: body.into_bytes(),
+                }
+            } else {
+                assert_eq!(
+                    req.crates_mfa_callback_secret,
+                    *seen_callback_secret.lock().unwrap(),
+                    "retry should preserve the callback secret"
+                );
+                *seen_otp.lock().unwrap() = req.crates_otp.clone();
+                assert_eq!(
+                    req.crates_otp.as_deref(),
+                    Some("TestOtp1"),
+                    "retry should send Crates-OTP"
+                );
+                server.check_authorized_publish(req)
+            }
+        })
+        .build();
+
+    let p = project()
+        .file(
+            "Cargo.toml",
+            r#"
+                [package]
+                name = "foo"
+                version = "0.0.1"
+                edition = "2015"
+                authors = []
+                license = "MIT"
+                description = "foo"
+                documentation = "foo"
+                homepage = "foo"
+                repository = "foo"
+            "#,
+        )
+        .file("src/lib.rs", "")
+        .build();
+
+    p.cargo("publish --no-verify --registry alternative")
+        .env("CARGO_API_MFA_PREFER_LOCALHOST", "1")
+        .with_stderr_data(str![[r#"
+[UPDATING] `alternative` index
+[PACKAGING] foo v0.0.1 ([..]foo)
+[PACKAGED] 4 files, [FILE_SIZE]B ([FILE_SIZE]B compressed)
+[UPLOADING] foo v0.0.1 ([..]foo)
+[NOTE] API MFA required; complete verification in your browser, then Cargo will retry
+[VERIFYING] please visit http://127.0.0.1:[..]/mfa/verify/mfa_otp (publish foo)
+[NOTE] API MFA OTP received; retrying request
+[UPLOADED] foo v0.0.1 to registry `alternative`
+[NOTE] waiting for foo v0.0.1 to be available at registry `alternative`
+[HELP] you may press ctrl-c to skip waiting; the crate should be available shortly
+[PUBLISHED] foo v0.0.1 at registry `alternative`
+
+"#]])
+        .run();
+
+    assert!(
+        seen_port2.lock().unwrap().is_some_and(|p| p >= 1024),
+        "expected Crates-MFA-Port >= 1024"
+    );
+    assert_eq!(
+        seen_callback_secret2
+            .lock()
+            .unwrap()
+            .as_deref()
+            .map(str::len),
+        Some(32)
+    );
+    assert_eq!(seen_otp2.lock().unwrap().as_deref(), Some("TestOtp1"));
+}
+
+/// Non-interactive / CI contexts fail fast on `mfa_required` (no poll wait).
+#[cargo_test]
+fn api_mfa_fail_fast_when_noninteractive() {
+    let _registry = RegistryBuilder::new()
+        .alternative()
+        .http_api()
+        .add_responder("/api/v1/crates/new", |req, _server| {
+            let origin = req.url.origin().ascii_serialization();
+            let body = format!(
+                r#"{{"errors":[{{"detail":"API MFA required","id":"mfa_required","operation_id":"mfa_ci","operation":"publish","crate":"foo","verification_url":"{origin}/mfa/verify/mfa_ci","poll_url":"{origin}/api/v1/mfa/challenges/mfa_ci","expires_at":"2099-01-01T00:00:00Z","recommended_poll_interval_secs":1}}]}}"#
+            );
+            Response {
+                code: 403,
+                headers: vec![],
+                body: body.into_bytes(),
+            }
+        })
+        .build();
+
+    let p = project()
+        .file(
+            "Cargo.toml",
+            r#"
+                [package]
+                name = "foo"
+                version = "0.0.1"
+                edition = "2015"
+                authors = []
+                license = "MIT"
+                description = "foo"
+                documentation = "foo"
+                homepage = "foo"
+                repository = "foo"
+            "#,
+        )
+        .file("src/lib.rs", "")
+        .build();
+
+    // No CARGO_API_MFA_INTERACTIVE / PREFER_LOCALHOST: CI + non-TTY → fail fast.
+    p.cargo("publish --no-verify --registry alternative")
+        .env("CI", "true")
+        .with_status(101)
+        .with_stderr_data(str![[r#"
+[UPDATING] `alternative` index
+[PACKAGING] foo v0.0.1 ([..]foo)
+[PACKAGED] 4 files, [FILE_SIZE]B ([FILE_SIZE]B compressed)
+[UPLOADING] foo v0.0.1 ([..]foo)
+[ERROR] failed to publish foo v0.0.1 to registry at http://127.0.0.1:[..]/
+
+Caused by:
+  API MFA required but Cargo is running non-interactively; visit http://127.0.0.1:[..]/mfa/verify/mfa_ci from an interactive session, use Trusted Publishing, or authorize MFA with your registry
 
 "#]])
         .run();

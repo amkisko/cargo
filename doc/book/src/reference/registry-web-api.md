@@ -57,13 +57,33 @@ include additional fields on the error object:
 ```
 
 When Cargo sees a non-success response with `id: "mfa_required"` and both
-`verification_url` and `poll_url`, it prints the verification URL, polls
-`poll_url` until the JSON response has `"status": "acknowledged"` (or
-`"acknowledged": true`), then retries the original request. `poll_url` must use
-the same origin (scheme, host, and port) as the registry API host from
-`config.json`; Cargo refuses cross-origin poll URLs and does not follow HTTP
-redirects on poll requests. Cargo clamps `recommended_poll_interval_secs` to
-between 1 and 30 seconds. Missing or expired challenges should return `404`.
+`verification_url` and `poll_url`, it completes the handshake then retries:
+
+1. Localhost OTP (preferred when interactive): Cargo binds `127.0.0.1`, sends
+   `Crates-MFA-Port` and a client-held `Crates-MFA-Callback-Secret` on the
+   mutating request, prints the verification URL
+   (with `operation` / `crate` when present), waits for the verify page to
+   `GET http://127.0.0.1:{port}/?code={otp}`, then retries with `Crates-OTP`.
+   Registries that receive a port should deliver the OTP to `127.0.0.1` and
+   should not rely on a multi-use grant for that challenge. Callback mode must
+   not be downgraded when a retry omits the port. A port replacement should
+   require the same callback secret that created the challenge.
+2. Poll fallback: When Cargo cannot (or chooses not to) use localhost, it
+   polls `poll_url` until the JSON response has `"status": "acknowledged"` (or
+   `"acknowledged": true`), then retries. Registries typically issue a short
+   scoped grant on acknowledgment for this path.
+
+`poll_url` must use the same origin (scheme, host, and port) as the registry
+API host from `config.json`; Cargo refuses cross-origin poll URLs and does not
+follow HTTP redirects on poll requests. Cargo clamps
+`recommended_poll_interval_secs` to between 1 and 30 seconds. Missing or
+expired challenges should return `404`.
+
+When `mfa_required` appears and Cargo is non-interactive (`CI=true`/`CI=1`, or
+stdin is not a terminal), Cargo fails fast with a clear error instead of
+waiting on poll or localhost. Set `CARGO_API_MFA_PREFER_LOCALHOST=1` to force
+the localhost OTP path, or `CARGO_API_MFA_INTERACTIVE=1` to allow the
+interactive handshake in tests and demos.
 
 For backwards compatibility, servers should ignore any unexpected query
 parameters or JSON fields. If a JSON field is missing, it should be assumed to

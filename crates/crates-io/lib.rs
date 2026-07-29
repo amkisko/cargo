@@ -43,6 +43,22 @@ pub struct Registry<T: HttpClient> {
     handle: T,
     /// Whether to include the authorization token with all requests.
     auth_required: bool,
+    /// Extra headers for interactive MFA (localhost port / OTP retry).
+    api_mfa_headers: ApiMfaHeaders,
+}
+
+/// Optional headers for the registry interactive MFA handshake.
+///
+/// When `port` is set, cargo listens on `127.0.0.1:{port}` for a one-shot OTP
+/// from the registry verify page (`Crates-MFA-Port`). `callback_secret`
+/// authorizes callback port refreshes without allowing a leaked API token to
+/// downgrade the challenge to a polling grant. After verification, the OTP is
+/// sent on retry as `Crates-OTP`.
+#[derive(Clone, Default)]
+pub struct ApiMfaHeaders {
+    pub port: Option<u16>,
+    pub callback_secret: Option<String>,
+    pub otp: Option<String>,
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -148,6 +164,10 @@ struct ApiError {
     expires_at: Option<String>,
     #[serde(default)]
     operation_id: Option<String>,
+    #[serde(default)]
+    operation: Option<String>,
+    #[serde(default, rename = "crate")]
+    crate_name: Option<String>,
 }
 
 /// Registry response when a dangerous API call needs interactive MFA acknowledgment.
@@ -157,6 +177,8 @@ struct ApiError {
 pub struct MfaRequired {
     pub detail: String,
     pub operation_id: Option<String>,
+    pub operation: Option<String>,
+    pub crate_name: Option<String>,
     pub verification_url: String,
     pub poll_url: String,
     pub recommended_poll_interval_secs: Option<u64>,
@@ -229,8 +251,10 @@ pub enum Error<T> {
 
     /// Registry requires interactive MFA (e.g. crates.io passkey step-up).
     ///
-    /// The CLI should print [`MfaRequired::verification_url`], poll
-    /// [`MfaRequired::poll_url`] until acknowledged, then retry the request.
+    /// The CLI should print [`MfaRequired::verification_url`], complete the
+    /// handshake via localhost OTP (preferred) or by polling
+    /// [`MfaRequired::poll_url`], then retry the request (with `Crates-OTP`
+    /// when using the OTP path).
     #[error("{}", .0.detail)]
     MfaRequired(MfaRequired),
 
@@ -310,11 +334,22 @@ impl<T: HttpClient> Registry<T> {
             token,
             handle,
             auth_required,
+            api_mfa_headers: ApiMfaHeaders::default(),
         }
     }
 
     pub fn set_token(&mut self, token: Option<String>) {
         self.token = token;
+    }
+
+    /// Sets MFA headers applied to subsequent mutating API requests.
+    pub fn set_api_mfa_headers(&mut self, headers: ApiMfaHeaders) {
+        self.api_mfa_headers = headers;
+    }
+
+    /// Clears MFA headers after a successful mutate or when abandoning a handshake.
+    pub fn clear_api_mfa_headers(&mut self) {
+        self.api_mfa_headers = ApiMfaHeaders::default();
     }
 
     fn token(&self) -> RegistryResult<&str, T::Error> {
@@ -393,10 +428,13 @@ impl<T: HttpClient> Registry<T> {
     ) -> RegistryResult<Warnings, T::Error> {
         let url = self.api_url("/crates/new");
 
-        let request = http::Request::put(url)
-            .header(http::header::CONTENT_TYPE, "application/octet-stream")
-            .header(http::header::ACCEPT, "application/json")
-            .header(http::header::AUTHORIZATION, self.token()?)
+        let request = self
+            .apply_api_mfa_headers(
+                http::Request::put(url)
+                    .header(http::header::CONTENT_TYPE, "application/octet-stream")
+                    .header(http::header::ACCEPT, "application/json")
+                    .header(http::header::AUTHORIZATION, self.token()?),
+            )
             .body(body.to_vec())?;
         let started = Instant::now();
         let response = self.handle.request(request).map_err(Error::Transport)?;
@@ -570,10 +608,24 @@ impl<T: HttpClient> Registry<T> {
 
         if self.auth_required || authorized == Auth::Authorized {
             request = request.header(http::header::AUTHORIZATION, self.token()?);
+            request = self.apply_api_mfa_headers(request);
         }
         let request = request.body(body.unwrap_or_default().to_vec())?;
         let response = self.handle.request(request).map_err(Error::Transport)?;
         self.handle(response)
+    }
+
+    fn apply_api_mfa_headers(&self, mut request: http::request::Builder) -> http::request::Builder {
+        if let Some(port) = self.api_mfa_headers.port {
+            request = request.header("Crates-MFA-Port", port.to_string());
+        }
+        if let Some(secret) = self.api_mfa_headers.callback_secret.as_deref() {
+            request = request.header("Crates-MFA-Callback-Secret", secret);
+        }
+        if let Some(otp) = self.api_mfa_headers.otp.as_deref() {
+            request = request.header("Crates-OTP", otp);
+        }
+        request
     }
 
     fn handle(&mut self, response: http::Response<Vec<u8>>) -> RegistryResult<String, T::Error> {
@@ -588,14 +640,14 @@ impl<T: HttpClient> Registry<T> {
             .map(|(k, v)| format!("{k}: {v}"))
             .collect();
 
-        // Only treat MFA on error responses. A 2xx body must not trigger a handshake
-        // even if it happens to contain similar JSON fields.
-        if !head.status.is_success() {
-            if let Some(list) = &api_errors {
-                if let Some(mfa) = list.errors.iter().find_map(mfa_required_from_api_error) {
-                    return Err(Error::MfaRequired(mfa));
-                }
-            }
+        // Only treat MFA from error bodies. crates.io historically returns
+        // `200 OK` for cargo endpoints even on failures (`cargo_compat`
+        // AdjustAll), so do not gate on HTTP status — look for the structured
+        // `mfa_required` error object whenever the body parses as an error list.
+        if let Some(list) = &api_errors
+            && let Some(mfa) = list.errors.iter().find_map(mfa_required_from_api_error)
+        {
+            return Err(Error::MfaRequired(mfa));
         }
 
         let errors = api_errors.map(|s| s.errors.into_iter().map(|s| s.detail).collect::<Vec<_>>());
@@ -625,6 +677,8 @@ fn mfa_required_from_api_error(err: &ApiError) -> Option<MfaRequired> {
     Some(MfaRequired {
         detail: err.detail.clone(),
         operation_id: err.operation_id.clone(),
+        operation: err.operation.clone(),
+        crate_name: err.crate_name.clone(),
         verification_url,
         poll_url,
         recommended_poll_interval_secs: err.recommended_poll_interval_secs,

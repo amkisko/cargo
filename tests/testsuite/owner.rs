@@ -255,10 +255,11 @@ fn api_mfa_required_then_retry() {
 
     p.cargo("owner -a username")
         .replace_crates_io(registry.index_url())
+        .env("CARGO_API_MFA_INTERACTIVE", "1")
         .with_stderr_data(str![[r#"
 [UPDATING] crates.io index
 [NOTE] API MFA required; complete verification in your browser, then Cargo will retry
-[VERIFYING] please visit http://127.0.0.1:[..]/mfa/verify/mfa_owners
+[VERIFYING] please visit http://127.0.0.1:[..]/mfa/verify/mfa_owners (change-owners foo)
 [NOTE] API MFA acknowledged; retrying request
 [OWNER] completed!
 

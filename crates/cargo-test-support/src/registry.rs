@@ -683,6 +683,12 @@ pub struct Request {
     pub authorization: Option<String>,
     pub if_modified_since: Option<String>,
     pub if_none_match: Option<String>,
+    /// `Crates-MFA-Port` when present (interactive MFA localhost OTP).
+    pub crates_mfa_port: Option<String>,
+    /// `Crates-MFA-Callback-Secret` when present.
+    pub crates_mfa_callback_secret: Option<String>,
+    /// `Crates-OTP` when present (interactive MFA retry).
+    pub crates_otp: Option<String>,
 }
 
 impl fmt::Debug for Request {
@@ -694,6 +700,8 @@ impl fmt::Debug for Request {
             .field("authorization", &self.authorization)
             .field("if_modified_since", &self.if_modified_since)
             .field("if_none_match", &self.if_none_match)
+            .field("crates_mfa_port", &self.crates_mfa_port)
+            .field("crates_otp", &self.crates_otp)
             .finish()
     }
 }
@@ -785,6 +793,9 @@ impl HttpServer {
             let mut if_modified_since = None;
             let mut if_none_match = None;
             let mut authorization = None;
+            let mut crates_mfa_port = None;
+            let mut crates_mfa_callback_secret = None;
+            let mut crates_otp = None;
             let mut content_len = None;
             loop {
                 line.clear();
@@ -803,6 +814,9 @@ impl HttpServer {
                     "if-modified-since" => if_modified_since = Some(value),
                     "if-none-match" => if_none_match = Some(value),
                     "authorization" => authorization = Some(value),
+                    "crates-mfa-port" => crates_mfa_port = Some(value),
+                    "crates-mfa-callback-secret" => crates_mfa_callback_secret = Some(value),
+                    "crates-otp" => crates_otp = Some(value),
                     "content-length" => content_len = Some(value),
                     _ => {}
                 }
@@ -820,6 +834,9 @@ impl HttpServer {
                 authorization,
                 if_modified_since,
                 if_none_match,
+                crates_mfa_port,
+                crates_mfa_callback_secret,
+                crates_otp,
                 method,
                 url,
                 body,
