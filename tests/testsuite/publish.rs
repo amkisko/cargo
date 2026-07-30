@@ -4914,9 +4914,9 @@ fn workspace_circular_publish_dependency_with_non_cycle_package() {
         .run();
 }
 
-/// Registry returns `mfa_required`; Cargo polls until acknowledged, then retries publish.
+/// Callback delivery never arrives; Cargo polls the same challenge and retries.
 #[cargo_test]
-fn api_mfa_required_then_retry() {
+fn step_up_callback_falls_back_to_poll_then_retry() {
     let publish_count = Arc::new(Mutex::new(0u32));
     let poll_count = Arc::new(Mutex::new(0u32));
     let poll_auths = Arc::new(Mutex::new(Vec::new()));
@@ -4929,9 +4929,17 @@ fn api_mfa_required_then_retry() {
             let mut n = publish_count.lock().unwrap();
             *n += 1;
             if *n == 1 {
+                assert!(
+                    req.crates_step_up_port.is_some(),
+                    "forced localhost channel should advertise a callback port"
+                );
+                assert!(
+                    req.crates_step_up_callback_secret.is_some(),
+                    "callback port must have listener state"
+                );
                 let origin = req.url.origin().ascii_serialization();
                 let body = format!(
-                    r#"{{"errors":[{{"detail":"API MFA required","id":"mfa_required","operation_id":"mfa_testop","operation":"publish","crate":"foo","verification_url":"{origin}/mfa/verify/mfa_testop","poll_url":"{origin}/api/v1/mfa/challenges/mfa_testop","expires_at":"2099-01-01T00:00:00Z","recommended_poll_interval_secs":1}}]}}"#
+                    r#"{{"errors":[{{"detail":"Additional authentication is required","id":"step_up_required","protocol_version":1,"interaction":"browser","challenge_id":"stp_testop","operation":"publish","crate":"foo","verification_url":"{origin}/verify/stp_testop","poll_url":"{origin}/api/v1/auth/challenges/stp_testop","expires_at":"2099-01-01T00:00:00Z","recommended_poll_interval_secs":1}}]}}"#
                 );
                 Response {
                     // crates.io compatibility middleware rewrites this error to 200.
@@ -4943,7 +4951,7 @@ fn api_mfa_required_then_retry() {
                 server.check_authorized_publish(req)
             }
         })
-        .add_responder("/api/v1/mfa/challenges/mfa_testop", move |req, _server| {
+        .add_responder("/api/v1/auth/challenges/stp_testop", move |req, _server| {
             poll_auths
                 .lock()
                 .unwrap()
@@ -4953,7 +4961,7 @@ fn api_mfa_required_then_retry() {
             let status = if *n == 1 { "pending" } else { "acknowledged" };
             let acknowledged = status == "acknowledged";
             let body = format!(
-                r#"{{"operation_id":"mfa_testop","status":"{status}","acknowledged":{acknowledged},"verified":{acknowledged},"operation":"publish","crate_name":"foo","expires_at":"2099-01-01T00:00:00Z","localhost_port":null,"recommended_poll_interval_secs":1}}"#
+                r#"{{"challenge_id":"stp_testop","status":"{status}","acknowledged":{acknowledged},"verified":{acknowledged},"operation":"publish","crate_name":"foo","expires_at":"2099-01-01T00:00:00Z","localhost_port":null,"recommended_poll_interval_secs":1}}"#
             );
             Response {
                 code: 200,
@@ -4983,15 +4991,15 @@ fn api_mfa_required_then_retry() {
         .build();
 
     p.cargo("publish --no-verify --registry alternative")
-        .env("CARGO_API_MFA_INTERACTIVE", "1")
+        .env("CARGO_STEP_UP_CHANNEL", "localhost")
         .with_stderr_data(str![[r#"
 [UPDATING] `alternative` index
 [PACKAGING] foo v0.0.1 ([..]foo)
 [PACKAGED] 4 files, [FILE_SIZE]B ([FILE_SIZE]B compressed)
 [UPLOADING] foo v0.0.1 ([..]foo)
-[NOTE] API MFA required; complete verification in your browser, then Cargo will retry
-[VERIFYING] please visit http://127.0.0.1:[..]/mfa/verify/mfa_testop (publish foo)
-[NOTE] API MFA acknowledged; retrying request
+[NOTE] additional authentication is required; complete verification in your browser, then Cargo will retry
+[VERIFYING] please visit http://127.0.0.1:[..]/verify/stp_testop (publish foo)
+[NOTE] step-up acknowledged; retrying request
 [UPLOADED] foo v0.0.1 to registry `alternative`
 [NOTE] waiting for foo v0.0.1 to be available at registry `alternative`
 [HELP] you may press ctrl-c to skip waiting; the crate should be available shortly
@@ -5005,20 +5013,20 @@ fn api_mfa_required_then_retry() {
         auths
             .iter()
             .all(|a| a.as_ref().is_some_and(|t| !t.is_empty())),
-        "MFA poll requests should include Authorization: {auths:?}"
+        "step-up poll requests should include Authorization: {auths:?}"
     );
 }
 
-/// Cargo refuses HTTP redirects on MFA poll URLs (SSRF via Location).
+/// Cargo refuses HTTP redirects on step-up poll URLs (SSRF via Location).
 #[cargo_test]
-fn api_mfa_rejects_poll_redirect() {
+fn step_up_rejects_poll_redirect() {
     let _registry = RegistryBuilder::new()
         .alternative()
         .http_api()
         .add_responder("/api/v1/crates/new", |req, _server| {
             let origin = req.url.origin().ascii_serialization();
             let body = format!(
-                r#"{{"errors":[{{"detail":"API MFA required","id":"mfa_required","operation_id":"mfa_redir","operation":"publish","crate":"foo","verification_url":"{origin}/mfa/verify/mfa_redir","poll_url":"{origin}/api/v1/mfa/challenges/mfa_redir","expires_at":"2099-01-01T00:00:00Z","recommended_poll_interval_secs":1}}]}}"#
+                r#"{{"errors":[{{"detail":"Additional authentication is required","id":"step_up_required","protocol_version":1,"interaction":"browser","challenge_id":"stp_redir","operation":"publish","crate":"foo","verification_url":"{origin}/verify/stp_redir","poll_url":"{origin}/api/v1/auth/challenges/stp_redir","expires_at":"2099-01-01T00:00:00Z","recommended_poll_interval_secs":1}}]}}"#
             );
             Response {
                 code: 403,
@@ -5027,7 +5035,7 @@ fn api_mfa_rejects_poll_redirect() {
             }
         })
         .add_responder(
-            "/api/v1/mfa/challenges/mfa_redir",
+            "/api/v1/auth/challenges/stp_redir",
             |_req, _server| Response {
                 code: 302,
                 headers: vec!["Location: http://127.0.0.1:9/".to_string()],
@@ -5056,34 +5064,34 @@ fn api_mfa_rejects_poll_redirect() {
         .build();
 
     p.cargo("publish --no-verify --registry alternative")
-        .env("CARGO_API_MFA_INTERACTIVE", "1")
+        .env("CARGO_STEP_UP_INTERACTIVE", "1")
         .with_status(101)
         .with_stderr_data(str![[r#"
 [UPDATING] `alternative` index
 [PACKAGING] foo v0.0.1 ([..]foo)
 [PACKAGED] 4 files, [FILE_SIZE]B ([FILE_SIZE]B compressed)
 [UPLOADING] foo v0.0.1 ([..]foo)
-[NOTE] API MFA required; complete verification in your browser, then Cargo will retry
-[VERIFYING] please visit http://127.0.0.1:[..]/mfa/verify/mfa_redir (publish foo)
+[NOTE] additional authentication is required; complete verification in your browser, then Cargo will retry
+[VERIFYING] please visit http://127.0.0.1:[..]/verify/stp_redir (publish foo)
 [ERROR] failed to publish foo v0.0.1 to registry at http://127.0.0.1:[..]/
 
 Caused by:
-  refusing to follow MFA poll redirect from `http://127.0.0.1:[..]/api/v1/mfa/challenges/mfa_redir` to `http://127.0.0.1:9/`
+  refusing to follow step-up poll redirect from `http://127.0.0.1:[..]/api/v1/auth/challenges/stp_redir` to `http://127.0.0.1:9/`
 
 "#]])
         .run();
 }
 
-/// Cargo refuses MFA poll URLs that do not share the registry API origin.
+/// Cargo refuses step-up poll URLs that do not share the registry API origin.
 #[cargo_test]
-fn api_mfa_rejects_cross_origin_poll_url() {
+fn step_up_rejects_cross_origin_poll_url() {
     let _registry = RegistryBuilder::new()
         .alternative()
         .http_api()
         .add_responder("/api/v1/crates/new", |req, _server| {
             let origin = req.url.origin().ascii_serialization();
             let body = format!(
-                r#"{{"errors":[{{"detail":"API MFA required","id":"mfa_required","operation_id":"mfa_evil","operation":"publish","crate":"foo","verification_url":"{origin}/mfa/verify/mfa_evil","poll_url":"http://127.0.0.1:9/evil","expires_at":"2099-01-01T00:00:00Z","recommended_poll_interval_secs":1}}]}}"#
+                r#"{{"errors":[{{"detail":"Additional authentication is required","id":"step_up_required","protocol_version":1,"interaction":"browser","challenge_id":"stp_evil","operation":"publish","crate":"foo","verification_url":"{origin}/verify/stp_evil","poll_url":"http://127.0.0.1:9/evil","expires_at":"2099-01-01T00:00:00Z","recommended_poll_interval_secs":1}}]}}"#
             );
             Response {
                 code: 403,
@@ -5113,34 +5121,32 @@ fn api_mfa_rejects_cross_origin_poll_url() {
         .build();
 
     p.cargo("publish --no-verify --registry alternative")
-        .env("CARGO_API_MFA_INTERACTIVE", "1")
+        .env("CARGO_STEP_UP_INTERACTIVE", "1")
         .with_status(101)
         .with_stderr_data(str![[r#"
 [UPDATING] `alternative` index
 [PACKAGING] foo v0.0.1 ([..]foo)
 [PACKAGED] 4 files, [FILE_SIZE]B ([FILE_SIZE]B compressed)
 [UPLOADING] foo v0.0.1 ([..]foo)
-[NOTE] API MFA required; complete verification in your browser, then Cargo will retry
-[VERIFYING] please visit http://127.0.0.1:[..]/mfa/verify/mfa_evil (publish foo)
 [ERROR] failed to publish foo v0.0.1 to registry at http://127.0.0.1:[..]/
 
 Caused by:
-  refusing to poll MFA status at `http://127.0.0.1:9/evil`; URL must use the same origin as the registry API (http://127.0.0.1:[..])
+  refusing to poll step-up status at `http://127.0.0.1:9/evil`; URL must use the same origin as the registry API (http://127.0.0.1:[..])
 
 "#]])
         .run();
 }
 
-/// Expired/missing MFA challenge (poll 404) fails with an actionable error.
+/// Expired/missing step-up challenge (poll 404) fails with an actionable error.
 #[cargo_test]
-fn api_mfa_poll_not_found() {
+fn step_up_poll_not_found() {
     let _registry = RegistryBuilder::new()
         .alternative()
         .http_api()
         .add_responder("/api/v1/crates/new", |req, _server| {
             let origin = req.url.origin().ascii_serialization();
             let body = format!(
-                r#"{{"errors":[{{"detail":"API MFA required","id":"mfa_required","operation_id":"mfa_gone","operation":"publish","crate":"foo","verification_url":"{origin}/mfa/verify/mfa_gone","poll_url":"{origin}/api/v1/mfa/challenges/mfa_gone","expires_at":"2099-01-01T00:00:00Z","recommended_poll_interval_secs":1}}]}}"#
+                r#"{{"errors":[{{"detail":"Additional authentication is required","id":"step_up_required","protocol_version":1,"interaction":"browser","challenge_id":"stp_gone","operation":"publish","crate":"foo","verification_url":"{origin}/verify/stp_gone","poll_url":"{origin}/api/v1/auth/challenges/stp_gone","expires_at":"2099-01-01T00:00:00Z","recommended_poll_interval_secs":1}}]}}"#
             );
             Response {
                 code: 403,
@@ -5148,7 +5154,7 @@ fn api_mfa_poll_not_found() {
                 body: body.into_bytes(),
             }
         })
-        .add_responder("/api/v1/mfa/challenges/mfa_gone", |_req, _server| Response {
+        .add_responder("/api/v1/auth/challenges/stp_gone", |_req, _server| Response {
             code: 404,
             headers: vec![],
             body: br#"{"errors":[{"detail":"not found"}]}"#.to_vec(),
@@ -5175,27 +5181,27 @@ fn api_mfa_poll_not_found() {
         .build();
 
     p.cargo("publish --no-verify --registry alternative")
-        .env("CARGO_API_MFA_INTERACTIVE", "1")
+        .env("CARGO_STEP_UP_INTERACTIVE", "1")
         .with_status(101)
         .with_stderr_data(str![[r#"
 [UPDATING] `alternative` index
 [PACKAGING] foo v0.0.1 ([..]foo)
 [PACKAGED] 4 files, [FILE_SIZE]B ([FILE_SIZE]B compressed)
 [UPLOADING] foo v0.0.1 ([..]foo)
-[NOTE] API MFA required; complete verification in your browser, then Cargo will retry
-[VERIFYING] please visit http://127.0.0.1:[..]/mfa/verify/mfa_gone (publish foo)
+[NOTE] additional authentication is required; complete verification in your browser, then Cargo will retry
+[VERIFYING] please visit http://127.0.0.1:[..]/verify/stp_gone (publish foo)
 [ERROR] failed to publish foo v0.0.1 to registry at http://127.0.0.1:[..]/
 
 Caused by:
-  API MFA challenge expired or was not found; visit http://127.0.0.1:[..]/mfa/verify/mfa_gone and retry the original command
+  step-up challenge expired or was not found; visit http://127.0.0.1:[..]/verify/stp_gone and retry the original command
 
 "#]])
         .run();
 }
 
-/// Registry returns `mfa_required`; Cargo listens on localhost, receives OTP, retries with `Crates-OTP`.
+/// Registry returns `step_up_required`; Cargo listens on localhost, receives OTP, retries with `Crates-OTP`.
 #[cargo_test]
-fn api_mfa_localhost_otp_then_retry() {
+fn step_up_localhost_otp_then_retry() {
     let publish_count = Arc::new(Mutex::new(0u32));
     let seen_port = Arc::new(Mutex::new(None::<u16>));
     let seen_callback_secret = Arc::new(Mutex::new(None::<String>));
@@ -5212,17 +5218,17 @@ fn api_mfa_localhost_otp_then_retry() {
             *n += 1;
             if *n == 1 {
                 let port = req
-                    .crates_mfa_port
+                    .crates_step_up_port
                     .as_deref()
                     .and_then(|p| p.parse::<u16>().ok())
-                    .expect("first publish should send Crates-MFA-Port");
+                    .expect("first publish should send Crates-Step-Up-Port");
                 *seen_port.lock().unwrap() = Some(port);
                 let callback_secret = req
-                    .crates_mfa_callback_secret
+                    .crates_step_up_callback_secret
                     .clone()
-                    .expect("first publish should send Crates-MFA-Callback-Secret");
+                    .expect("first publish should send Crates-Step-Up-Callback-Secret");
                 assert_eq!(callback_secret.len(), 32);
-                *seen_callback_secret.lock().unwrap() = Some(callback_secret);
+                *seen_callback_secret.lock().unwrap() = Some(callback_secret.clone());
                 // Simulate the verify page hitting `/?code=` on cargo's listener.
                 std::thread::spawn(move || {
                     std::thread::sleep(std::time::Duration::from_millis(50));
@@ -5230,13 +5236,13 @@ fn api_mfa_localhost_otp_then_retry() {
                         use std::io::Write;
                         let _ = write!(
                             stream,
-                            "GET /?code=TestOtp1 HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
+                            "GET /?code=TestOtp1&state={callback_secret} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
                         );
                     }
                 });
                 let origin = req.url.origin().ascii_serialization();
                 let body = format!(
-                    r#"{{"errors":[{{"detail":"API MFA required","id":"mfa_required","operation_id":"mfa_otp","operation":"publish","crate":"foo","verification_url":"{origin}/mfa/verify/mfa_otp","poll_url":"{origin}/api/v1/mfa/challenges/mfa_otp","expires_at":"2099-01-01T00:00:00Z","recommended_poll_interval_secs":1}}]}}"#
+                    r#"{{"errors":[{{"detail":"Additional authentication is required","id":"step_up_required","protocol_version":1,"interaction":"browser","challenge_id":"stp_otp","operation":"publish","crate":"foo","verification_url":"{origin}/verify/stp_otp","poll_url":"{origin}/api/v1/auth/challenges/stp_otp","expires_at":"2099-01-01T00:00:00Z","recommended_poll_interval_secs":1}}]}}"#
                 );
                 Response {
                     code: 403,
@@ -5245,7 +5251,7 @@ fn api_mfa_localhost_otp_then_retry() {
                 }
             } else {
                 assert_eq!(
-                    req.crates_mfa_callback_secret,
+                    req.crates_step_up_callback_secret,
                     *seen_callback_secret.lock().unwrap(),
                     "retry should preserve the callback secret"
                 );
@@ -5280,15 +5286,15 @@ fn api_mfa_localhost_otp_then_retry() {
         .build();
 
     p.cargo("publish --no-verify --registry alternative")
-        .env("CARGO_API_MFA_PREFER_LOCALHOST", "1")
+        .env("CARGO_STEP_UP_PREFER_LOCALHOST", "1")
         .with_stderr_data(str![[r#"
 [UPDATING] `alternative` index
 [PACKAGING] foo v0.0.1 ([..]foo)
 [PACKAGED] 4 files, [FILE_SIZE]B ([FILE_SIZE]B compressed)
 [UPLOADING] foo v0.0.1 ([..]foo)
-[NOTE] API MFA required; complete verification in your browser, then Cargo will retry
-[VERIFYING] please visit http://127.0.0.1:[..]/mfa/verify/mfa_otp (publish foo)
-[NOTE] API MFA OTP received; retrying request
+[NOTE] additional authentication is required; complete verification in your browser, then Cargo will retry
+[VERIFYING] please visit http://127.0.0.1:[..]/verify/stp_otp (publish foo)
+[NOTE] step-up OTP received; retrying request
 [UPLOADED] foo v0.0.1 to registry `alternative`
 [NOTE] waiting for foo v0.0.1 to be available at registry `alternative`
 [HELP] you may press ctrl-c to skip waiting; the crate should be available shortly
@@ -5299,7 +5305,7 @@ fn api_mfa_localhost_otp_then_retry() {
 
     assert!(
         seen_port2.lock().unwrap().is_some_and(|p| p >= 1024),
-        "expected Crates-MFA-Port >= 1024"
+        "expected Crates-Step-Up-Port >= 1024"
     );
     assert_eq!(
         seen_callback_secret2
@@ -5312,16 +5318,16 @@ fn api_mfa_localhost_otp_then_retry() {
     assert_eq!(seen_otp2.lock().unwrap().as_deref(), Some("TestOtp1"));
 }
 
-/// Non-interactive / CI contexts fail fast on `mfa_required` (no poll wait).
+/// Non-interactive / CI contexts fail fast on `step_up_required` (no poll wait).
 #[cargo_test]
-fn api_mfa_fail_fast_when_noninteractive() {
+fn step_up_fail_fast_when_noninteractive() {
     let _registry = RegistryBuilder::new()
         .alternative()
         .http_api()
         .add_responder("/api/v1/crates/new", |req, _server| {
             let origin = req.url.origin().ascii_serialization();
             let body = format!(
-                r#"{{"errors":[{{"detail":"API MFA required","id":"mfa_required","operation_id":"mfa_ci","operation":"publish","crate":"foo","verification_url":"{origin}/mfa/verify/mfa_ci","poll_url":"{origin}/api/v1/mfa/challenges/mfa_ci","expires_at":"2099-01-01T00:00:00Z","recommended_poll_interval_secs":1}}]}}"#
+                r#"{{"errors":[{{"detail":"Additional authentication is required","id":"step_up_required","protocol_version":1,"interaction":"browser","challenge_id":"stp_ci","operation":"publish","crate":"foo","verification_url":"{origin}/verify/stp_ci","poll_url":"{origin}/api/v1/auth/challenges/stp_ci","expires_at":"2099-01-01T00:00:00Z","recommended_poll_interval_secs":1}}]}}"#
             );
             Response {
                 code: 403,
@@ -5350,7 +5356,7 @@ fn api_mfa_fail_fast_when_noninteractive() {
         .file("src/lib.rs", "")
         .build();
 
-    // No CARGO_API_MFA_INTERACTIVE / PREFER_LOCALHOST: CI + non-TTY → fail fast.
+    // No CARGO_STEP_UP_INTERACTIVE / PREFER_LOCALHOST: CI + non-TTY → fail fast.
     p.cargo("publish --no-verify --registry alternative")
         .env("CI", "true")
         .with_status(101)
@@ -5362,7 +5368,7 @@ fn api_mfa_fail_fast_when_noninteractive() {
 [ERROR] failed to publish foo v0.0.1 to registry at http://127.0.0.1:[..]/
 
 Caused by:
-  API MFA required but Cargo is running non-interactively; visit http://127.0.0.1:[..]/mfa/verify/mfa_ci from an interactive session, use Trusted Publishing, or authorize MFA with your registry
+  additional authentication is required but Cargo is running non-interactively; visit http://127.0.0.1:[..]/verify/stp_ci from an interactive session, use Trusted Publishing, or complete additional authentication with your registry
 
 "#]])
         .run();

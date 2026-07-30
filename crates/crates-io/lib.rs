@@ -24,7 +24,7 @@ pub trait HttpClient {
 
     /// Like [`Self::request`], but HTTP redirects must not be followed.
     ///
-    /// Used for MFA challenge polls so a same-origin `poll_url` cannot redirect
+    /// Used for step-up challenge polls so a same-origin `poll_url` cannot redirect
     /// the client to loopback or other internal addresses. The default
     /// implementation calls [`Self::request`]; production clients should override
     /// this to disable redirect following.
@@ -43,19 +43,19 @@ pub struct Registry<T: HttpClient> {
     handle: T,
     /// Whether to include the authorization token with all requests.
     auth_required: bool,
-    /// Extra headers for interactive MFA (localhost port / OTP retry).
-    api_mfa_headers: ApiMfaHeaders,
+    /// Extra headers for interactive step-up (localhost port / OTP retry).
+    step_up_headers: StepUpHeaders,
 }
 
-/// Optional headers for the registry interactive MFA handshake.
+/// Optional headers for the registry interactive step-up handshake.
 ///
 /// When `port` is set, cargo listens on `127.0.0.1:{port}` for a one-shot OTP
-/// from the registry verify page (`Crates-MFA-Port`). `callback_secret`
-/// authorizes callback port refreshes without allowing a leaked API token to
-/// downgrade the challenge to a polling grant. After verification, the OTP is
-/// sent on retry as `Crates-OTP`.
+/// from the registry verify page (`Crates-Step-Up-Port`). `callback_secret`
+/// authorizes callback port refreshes and is returned as listener callback
+/// state. Callback challenges remain pollable through an exact scoped grant.
+/// When the callback wins, the OTP is sent on retry as `Crates-OTP`.
 #[derive(Clone, Default)]
-pub struct ApiMfaHeaders {
+pub struct StepUpHeaders {
     pub port: Option<u16>,
     pub callback_secret: Option<String>,
     pub otp: Option<String>,
@@ -149,11 +149,13 @@ struct OwnerResponse {
 struct ApiErrorList {
     errors: Vec<ApiError>,
 }
-#[derive(Deserialize)]
+#[derive(Default, Deserialize)]
 struct ApiError {
     detail: String,
     #[serde(default)]
     id: Option<String>,
+    #[serde(default)]
+    protocol_version: Option<u64>,
     #[serde(default)]
     verification_url: Option<String>,
     #[serde(default)]
@@ -163,20 +165,26 @@ struct ApiError {
     #[serde(default)]
     expires_at: Option<String>,
     #[serde(default)]
-    operation_id: Option<String>,
+    challenge_id: Option<String>,
+    #[serde(default)]
+    interaction: Option<String>,
     #[serde(default)]
     operation: Option<String>,
     #[serde(default, rename = "crate")]
     crate_name: Option<String>,
 }
 
-/// Registry response when a dangerous API call needs interactive MFA acknowledgment.
+/// Registry response when a dangerous API call needs an interactive step-up challenge.
 ///
-/// See the crates.io API MFA handshake (`errors[].id == "mfa_required"`).
+/// See the crates.io step-up handshake (`errors[].id == "step_up_required"`).
 #[derive(Debug, Clone)]
-pub struct MfaRequired {
+pub struct StepUpRequired {
     pub detail: String,
-    pub operation_id: Option<String>,
+    pub challenge_id: Option<String>,
+    /// Version of the step-up wire contract.
+    pub protocol_version: u64,
+    /// How the client should proceed. Version 1 requires `"browser"`.
+    pub interaction: String,
     pub operation: Option<String>,
     pub crate_name: Option<String>,
     pub verification_url: String,
@@ -185,9 +193,9 @@ pub struct MfaRequired {
     pub expires_at: Option<String>,
 }
 
-/// Poll response body for `GET` of [`MfaRequired::poll_url`].
+/// Poll response body for `GET` of [`StepUpRequired::poll_url`].
 #[derive(Debug, Deserialize)]
-pub struct MfaChallengeStatus {
+pub struct StepUpChallengeStatus {
     pub status: String,
     #[serde(default)]
     pub acknowledged: bool,
@@ -249,35 +257,35 @@ pub enum Error<T> {
         errors: Vec<String>,
     },
 
-    /// Registry requires interactive MFA (e.g. crates.io passkey step-up).
+    /// Registry requires interactive step-up (e.g. crates.io passkey).
     ///
-    /// The CLI should print [`MfaRequired::verification_url`], complete the
+    /// The CLI should print [`StepUpRequired::verification_url`], complete the
     /// handshake via localhost OTP (preferred) or by polling
-    /// [`MfaRequired::poll_url`], then retry the request (with `Crates-OTP`
+    /// [`StepUpRequired::poll_url`], then retry the request (with `Crates-OTP`
     /// when using the OTP path).
     #[error("{}", .0.detail)]
-    MfaRequired(MfaRequired),
+    StepUpRequired(StepUpRequired),
 
-    /// `poll_url` from an MFA challenge did not share the registry API origin.
+    /// `poll_url` from a step-up challenge did not share the registry API origin.
     ///
     /// Cargo refuses to follow cross-origin poll URLs to avoid SSRF from a
     /// malicious registry response.
     #[error(
-        "refusing to poll MFA status at `{poll_url}`; \
+        "refusing to poll step-up status at `{poll_url}`; \
          URL must use the same origin as the registry API ({registry_host})"
     )]
-    InvalidMfaPollUrl {
+    InvalidStepUpPollUrl {
         poll_url: String,
         registry_host: String,
     },
 
-    /// MFA poll responded with an HTTP redirect.
+    /// Step-up poll responded with an HTTP redirect.
     ///
     /// Poll requests do not follow redirects so a malicious registry cannot
     /// bounce the client onto loopback or link-local addresses after the
     /// same-origin check passes.
-    #[error("refusing to follow MFA poll redirect from `{poll_url}`")]
-    InvalidMfaPollRedirect {
+    #[error("refusing to follow step-up poll redirect from `{poll_url}`")]
+    InvalidStepUpPollRedirect {
         poll_url: String,
         location: Option<String>,
     },
@@ -334,7 +342,7 @@ impl<T: HttpClient> Registry<T> {
             token,
             handle,
             auth_required,
-            api_mfa_headers: ApiMfaHeaders::default(),
+            step_up_headers: StepUpHeaders::default(),
         }
     }
 
@@ -342,14 +350,14 @@ impl<T: HttpClient> Registry<T> {
         self.token = token;
     }
 
-    /// Sets MFA headers applied to subsequent mutating API requests.
-    pub fn set_api_mfa_headers(&mut self, headers: ApiMfaHeaders) {
-        self.api_mfa_headers = headers;
+    /// Sets step-up headers applied to subsequent mutating API requests.
+    pub fn set_step_up_headers(&mut self, headers: StepUpHeaders) {
+        self.step_up_headers = headers;
     }
 
-    /// Clears MFA headers after a successful mutate or when abandoning a handshake.
-    pub fn clear_api_mfa_headers(&mut self) {
-        self.api_mfa_headers = ApiMfaHeaders::default();
+    /// Clears step-up headers after a successful mutate or when abandoning a handshake.
+    pub fn clear_step_up_headers(&mut self) {
+        self.step_up_headers = StepUpHeaders::default();
     }
 
     fn token(&self) -> RegistryResult<&str, T::Error> {
@@ -387,7 +395,7 @@ impl<T: HttpClient> Registry<T> {
 
     /// Builds the `/crates/new` request body (crate metadata + tarball).
     ///
-    /// Callers that may retry the upload (for example after an MFA handshake)
+    /// Callers that may retry the upload (for example after a step-up handshake)
     /// should build the body once and pass it to [`Self::publish_body`].
     pub fn prepare_publish_body(
         krate: &NewCrate,
@@ -429,7 +437,7 @@ impl<T: HttpClient> Registry<T> {
         let url = self.api_url("/crates/new");
 
         let request = self
-            .apply_api_mfa_headers(
+            .apply_step_up_headers(
                 http::Request::put(url)
                     .header(http::header::CONTENT_TYPE, "application/octet-stream")
                     .header(http::header::ACCEPT, "application/json")
@@ -521,16 +529,16 @@ impl<T: HttpClient> Registry<T> {
         Ok(())
     }
 
-    /// Polls an MFA challenge status endpoint.
+    /// Polls a step-up challenge status endpoint.
     ///
     /// `poll_url` must share scheme/host/port with [`Registry::host`]. Redirects
     /// are not followed.
-    pub fn poll_mfa_challenge(
+    pub fn poll_step_up_challenge(
         &mut self,
         poll_url: &str,
-    ) -> RegistryResult<MfaChallengeStatus, T::Error> {
+    ) -> RegistryResult<StepUpChallengeStatus, T::Error> {
         if !url_shares_origin_with_registry(poll_url, &self.host) {
-            return Err(Error::InvalidMfaPollUrl {
+            return Err(Error::InvalidStepUpPollUrl {
                 poll_url: poll_url.to_owned(),
                 registry_host: self.host.clone(),
             });
@@ -557,7 +565,7 @@ impl<T: HttpClient> Registry<T> {
                 .get(http::header::LOCATION)
                 .and_then(|value| value.to_str().ok())
                 .map(str::to_owned);
-            return Err(Error::InvalidMfaPollRedirect {
+            return Err(Error::InvalidStepUpPollRedirect {
                 poll_url: poll_url.to_owned(),
                 location,
             });
@@ -608,21 +616,21 @@ impl<T: HttpClient> Registry<T> {
 
         if self.auth_required || authorized == Auth::Authorized {
             request = request.header(http::header::AUTHORIZATION, self.token()?);
-            request = self.apply_api_mfa_headers(request);
+            request = self.apply_step_up_headers(request);
         }
         let request = request.body(body.unwrap_or_default().to_vec())?;
         let response = self.handle.request(request).map_err(Error::Transport)?;
         self.handle(response)
     }
 
-    fn apply_api_mfa_headers(&self, mut request: http::request::Builder) -> http::request::Builder {
-        if let Some(port) = self.api_mfa_headers.port {
-            request = request.header("Crates-MFA-Port", port.to_string());
+    fn apply_step_up_headers(&self, mut request: http::request::Builder) -> http::request::Builder {
+        if let Some(port) = self.step_up_headers.port {
+            request = request.header("Crates-Step-Up-Port", port.to_string());
         }
-        if let Some(secret) = self.api_mfa_headers.callback_secret.as_deref() {
-            request = request.header("Crates-MFA-Callback-Secret", secret);
+        if let Some(secret) = self.step_up_headers.callback_secret.as_deref() {
+            request = request.header("Crates-Step-Up-Callback-Secret", secret);
         }
-        if let Some(otp) = self.api_mfa_headers.otp.as_deref() {
+        if let Some(otp) = self.step_up_headers.otp.as_deref() {
             request = request.header("Crates-OTP", otp);
         }
         request
@@ -640,14 +648,14 @@ impl<T: HttpClient> Registry<T> {
             .map(|(k, v)| format!("{k}: {v}"))
             .collect();
 
-        // Only treat MFA from error bodies. crates.io historically returns
-        // `200 OK` for cargo endpoints even on failures (`cargo_compat`
+        // Only treat step-up challenges from error bodies. crates.io historically
+        // returns `200 OK` for cargo endpoints even on failures (`cargo_compat`
         // AdjustAll), so do not gate on HTTP status — look for the structured
-        // `mfa_required` error object whenever the body parses as an error list.
+        // `step_up_required` error object whenever the body parses as an error list.
         if let Some(list) = &api_errors
-            && let Some(mfa) = list.errors.iter().find_map(mfa_required_from_api_error)
+            && let Some(step_up) = list.errors.iter().find_map(step_up_required_from_api_error)
         {
-            return Err(Error::MfaRequired(mfa));
+            return Err(Error::StepUpRequired(step_up));
         }
 
         let errors = api_errors.map(|s| s.errors.into_iter().map(|s| s.detail).collect::<Vec<_>>());
@@ -668,15 +676,20 @@ impl<T: HttpClient> Registry<T> {
     }
 }
 
-fn mfa_required_from_api_error(err: &ApiError) -> Option<MfaRequired> {
-    if err.id.as_deref() != Some("mfa_required") {
+fn step_up_required_from_api_error(err: &ApiError) -> Option<StepUpRequired> {
+    if err.id.as_deref() != Some("step_up_required")
+        || err.protocol_version != Some(1)
+        || err.interaction.as_deref() != Some("browser")
+    {
         return None;
     }
     let verification_url = err.verification_url.clone()?;
     let poll_url = err.poll_url.clone()?;
-    Some(MfaRequired {
+    Some(StepUpRequired {
         detail: err.detail.clone(),
-        operation_id: err.operation_id.clone(),
+        challenge_id: err.challenge_id.clone(),
+        protocol_version: 1,
+        interaction: "browser".into(),
         operation: err.operation.clone(),
         crate_name: err.crate_name.clone(),
         verification_url,
@@ -753,37 +766,81 @@ pub fn check_token(token: &str) -> Result<(), TokenError> {
 
 #[cfg(test)]
 mod tests {
-    use super::url_shares_origin_with_registry;
+    use super::{ApiError, step_up_required_from_api_error, url_shares_origin_with_registry};
 
     #[test]
-    fn mfa_poll_url_same_origin() {
+    fn step_up_poll_url_same_origin() {
         assert!(url_shares_origin_with_registry(
-            "https://crates.io/api/v1/mfa/challenges/mfa_x",
+            "https://crates.io/api/v1/auth/challenges/stp_x",
             "https://crates.io",
         ));
         assert!(url_shares_origin_with_registry(
-            "http://127.0.0.1:1234/api/v1/mfa/challenges/mfa_x",
+            "http://127.0.0.1:1234/api/v1/auth/challenges/stp_x",
             "http://127.0.0.1:1234",
         ));
     }
 
     #[test]
-    fn mfa_poll_url_rejects_cross_origin() {
+    fn step_up_poll_url_rejects_cross_origin() {
         assert!(!url_shares_origin_with_registry(
             "http://127.0.0.1:9/secret",
             "https://crates.io",
         ));
         assert!(!url_shares_origin_with_registry(
-            "https://evil.example/api/v1/mfa/challenges/mfa_x",
+            "https://evil.example/api/v1/auth/challenges/stp_x",
             "https://crates.io",
         ));
         assert!(!url_shares_origin_with_registry(
-            "https://crates.io:443/api/v1/mfa/challenges/mfa_x",
+            "https://crates.io:443/api/v1/auth/challenges/stp_x",
             "http://crates.io",
         ));
         assert!(!url_shares_origin_with_registry(
             "not a url",
             "https://crates.io"
         ));
+    }
+
+    #[test]
+    fn step_up_required_parses_version_one_browser_contract() {
+        let error = valid_step_up_error();
+        let step_up = step_up_required_from_api_error(&error).unwrap();
+        assert_eq!(step_up.protocol_version, 1);
+        assert_eq!(step_up.interaction, "browser");
+        assert_eq!(step_up.verification_url, "https://crates.io/verify/stp_x");
+        assert_eq!(
+            step_up.poll_url,
+            "https://crates.io/api/v1/auth/challenges/stp_x"
+        );
+    }
+
+    #[test]
+    fn step_up_required_rejects_incomplete_or_unknown_contracts() {
+        let mut missing_version = valid_step_up_error();
+        missing_version.protocol_version = None;
+        assert!(step_up_required_from_api_error(&missing_version).is_none());
+
+        let mut unknown_version = valid_step_up_error();
+        unknown_version.protocol_version = Some(2);
+        assert!(step_up_required_from_api_error(&unknown_version).is_none());
+
+        let mut unknown_interaction = valid_step_up_error();
+        unknown_interaction.interaction = Some("device-code".into());
+        assert!(step_up_required_from_api_error(&unknown_interaction).is_none());
+
+        let mut missing_poll_url = valid_step_up_error();
+        missing_poll_url.poll_url = None;
+        assert!(step_up_required_from_api_error(&missing_poll_url).is_none());
+    }
+
+    fn valid_step_up_error() -> ApiError {
+        ApiError {
+            detail: "Additional authentication is required".into(),
+            id: Some("step_up_required".into()),
+            protocol_version: Some(1),
+            interaction: Some("browser".into()),
+            verification_url: Some("https://crates.io/verify/stp_x".into()),
+            poll_url: Some("https://crates.io/api/v1/auth/challenges/stp_x".into()),
+            ..ApiError::default()
+        }
     }
 }

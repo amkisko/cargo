@@ -2,7 +2,6 @@
 //!
 //! [1]: https://doc.rust-lang.org/nightly/cargo/reference/registry-web-api.html
 
-mod api_mfa;
 mod cargo_info;
 mod cargo_login;
 mod cargo_logout;
@@ -10,6 +9,7 @@ mod cargo_owner;
 mod cargo_publish;
 mod cargo_search;
 mod cargo_yank;
+mod step_up;
 
 use crate::util::data_structures::HashSet;
 use std::str;

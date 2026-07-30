@@ -678,7 +678,7 @@ fn transmit(
         )
     })?;
 
-    let warnings = super::api_mfa::with_api_mfa_retry(gctx, registry, |registry| {
+    let warnings = super::step_up::with_step_up_retry(gctx, registry, |registry| {
         registry.publish_body(&body, tarball_len)
     })
     .with_context(|| {

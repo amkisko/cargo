@@ -32,64 +32,80 @@ If the response code indicates an error and the content does not have this struc
  message intended to help debugging the server error. A server returning an `errors` object allows a registry to provide a more
 detailed or user-centric error message.
 
-### Interactive MFA (`mfa_required`)
+### Interactive additional authentication (`step_up_required`)
 
-Registries may require an interactive second factor for publish, yank, unyank,
-or owner changes. In that case the failure response should use status `403` and
-include additional fields on the error object:
+Registries may require additional interactive authentication for publish, yank,
+unyank, or owner changes. In security architecture terms this is step-up
+authentication; Cargo only needs to understand the wire contract below. The
+failure response should use status `403` (valid token, inadequate for the
+protected operation) and include:
 
 ```javascript
 {
     "errors": [
         {
-            "detail": "API MFA required",
-            "id": "mfa_required",
-            "operation_id": "mfa_…",
+            "detail": "Additional authentication is required",
+            "id": "step_up_required",
+            "protocol_version": 1,
+            "interaction": "browser",
+            "challenge_id": "stp_…",
             "operation": "publish",
             "crate": "example",
-            "verification_url": "https://example.com/mfa/verify/mfa_…",
-            "poll_url": "https://example.com/api/v1/mfa/challenges/mfa_…",
+            "verification_url": "https://example.com/verify/stp_…",
+            "poll_url": "https://example.com/api/v1/auth/challenges/stp_…",
             "expires_at": "2026-01-01T00:00:00Z",
-            "recommended_poll_interval_secs": 2
+            "recommended_poll_interval_secs": 5
         }
     ]
 }
 ```
 
-When Cargo sees a non-success response with `id: "mfa_required"` and both
+`protocol_version: 1` and `interaction: "browser"` identify the contract Cargo
+implements. Completion transport is either an authenticated localhost OTP
+callback (one-time proof) or polling (exact scoped grant). The website chooses
+the authentication method; Cargo does not interpret factors.
+
+When Cargo sees a non-success response with `id: "step_up_required"` and both
 `verification_url` and `poll_url`, it completes the handshake then retries:
 
 1. Localhost OTP (preferred when interactive): Cargo binds `127.0.0.1`, sends
-   `Crates-MFA-Port` and a client-held `Crates-MFA-Callback-Secret` on the
+   `Crates-Step-Up-Port` and a client-held `Crates-Step-Up-Callback-Secret` on the
    mutating request, prints the verification URL
    (with `operation` / `crate` when present), waits for the verify page to
-   `GET http://127.0.0.1:{port}/?code={otp}`, then retries with `Crates-OTP`.
-   Registries that receive a port should deliver the OTP to `127.0.0.1` and
-   should not rely on a multi-use grant for that challenge. Callback mode must
-   not be downgraded when a retry omits the port. A port replacement should
-   require the same callback secret that created the challenge.
+   `GET http://127.0.0.1:{port}/?code={otp}&state={callback_secret}`, then
+   retries with `Crates-OTP`. Cargo rejects callbacks whose state does not match.
+   A port replacement should require the same callback secret that created the
+   challenge.
 2. Poll fallback: When Cargo cannot (or chooses not to) use localhost, it
    polls `poll_url` until the JSON response has `"status": "acknowledged"` (or
-   `"acknowledged": true`), then retries. Registries typically issue a short
-   scoped grant on acknowledgment for this path.
+   `"acknowledged": true`), then retries. Callback-enabled challenges remain
+   pollable, and registries issue a short grant scoped to the exact token and
+   mutation on acknowledgment. Cargo waits for callback and poll concurrently,
+   so callback delivery failure does not strand the mutation. Prefer `status`
+   over the bool aliases.
 
-`poll_url` must use the same origin (scheme, host, and port) as the registry
-API host from `config.json`; Cargo refuses cross-origin poll URLs and does not
-follow HTTP redirects on poll requests. Cargo clamps
-`recommended_poll_interval_secs` to between 1 and 30 seconds. Missing or
-expired challenges should return `404`.
+`verification_url` and `poll_url` must use the same origin (scheme, host, and
+port) as the registry API host from `config.json`; Cargo refuses cross-origin
+URLs and does not follow HTTP redirects on poll requests.
+`recommended_poll_interval_secs` is a minimum interval; Cargo clamps it to
+between 1 and 30 seconds. Missing or expired challenges should return `404`.
 
-When `mfa_required` appears and Cargo is non-interactive (`CI=true`/`CI=1`, or
+When `step_up_required` appears and Cargo is non-interactive (`CI=true`/`CI=1`, or
 stdin is not a terminal), Cargo fails fast with a clear error instead of
-waiting on poll or localhost. Set `CARGO_API_MFA_PREFER_LOCALHOST=1` to force
-the localhost OTP path, or `CARGO_API_MFA_INTERACTIVE=1` to allow the
+waiting on poll or localhost. Set `CARGO_STEP_UP_PREFER_LOCALHOST=1` to force
+the localhost OTP path, or `CARGO_STEP_UP_INTERACTIVE=1` to allow the
 interactive handshake in tests and demos.
 
-For backwards compatibility, servers should ignore any unexpected query
-parameters or JSON fields. If a JSON field is missing, it should be assumed to
-be null. The endpoints are versioned with the `v1` component of the path, and
-Cargo is responsible for handling backwards compatibility fallbacks should any
-be required in the future.
+`CARGO_STEP_UP_CHANNEL` selects `auto`, `localhost`, `poll`, or `disabled`.
+Interactive SSH sessions should use `poll` when the browser cannot reach the
+remote host's loopback listener. An explicit `localhost` or `poll` choice opts
+into the interactive wait even when Cargo's TTY/CI heuristic would fail fast.
+
+Servers should ignore unexpected query parameters or JSON fields. Cargo only
+enters the interactive flow when `id`, `protocol_version`, `interaction`,
+`verification_url`, and `poll_url` form the supported version 1 browser
+contract. Missing fields and unknown versions or interaction modes remain
+ordinary registry errors.
 
 Cargo sets the `User-Agent` header for all requests to the Cargo version such
 as `cargo/1.32.0 (8610973aa 2019-01-02)`. This may be modified by the user in

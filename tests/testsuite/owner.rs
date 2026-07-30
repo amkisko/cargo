@@ -194,9 +194,9 @@ fn simple_remove_with_asymmetric() {
         .run();
 }
 
-/// Registry returns `mfa_required`; Cargo polls until acknowledged, then retries owner add.
+/// Registry returns `step_up_required`; Cargo polls until acknowledged, then retries owner add.
 #[cargo_test]
-fn api_mfa_required_then_retry() {
+fn step_up_required_then_retry() {
     let owner_count = Arc::new(Mutex::new(0u32));
     let poll_count = Arc::new(Mutex::new(0u32));
 
@@ -211,7 +211,7 @@ fn api_mfa_required_then_retry() {
             if *n == 1 {
                 let origin = req.url.origin().ascii_serialization();
                 let body = format!(
-                    r#"{{"errors":[{{"detail":"API MFA required","id":"mfa_required","operation_id":"mfa_owners","operation":"change-owners","crate":"foo","verification_url":"{origin}/mfa/verify/mfa_owners","poll_url":"{origin}/api/v1/mfa/challenges/mfa_owners","expires_at":"2099-01-01T00:00:00Z","recommended_poll_interval_secs":1}}]}}"#
+                    r#"{{"errors":[{{"detail":"Additional authentication is required","id":"step_up_required","protocol_version":1,"interaction":"browser","challenge_id":"stp_owners","operation":"change-owners","crate":"foo","verification_url":"{origin}/verify/stp_owners","poll_url":"{origin}/api/v1/auth/challenges/stp_owners","expires_at":"2099-01-01T00:00:00Z","recommended_poll_interval_secs":1}}]}}"#
                 );
                 Response {
                     code: 403,
@@ -222,13 +222,13 @@ fn api_mfa_required_then_retry() {
                 server.ok(req)
             }
         })
-        .add_responder("/api/v1/mfa/challenges/mfa_owners", move |_req, _server| {
+        .add_responder("/api/v1/auth/challenges/stp_owners", move |_req, _server| {
             let mut n = poll_count.lock().unwrap();
             *n += 1;
             let status = if *n == 1 { "pending" } else { "acknowledged" };
             let acknowledged = status == "acknowledged";
             let body = format!(
-                r#"{{"operation_id":"mfa_owners","status":"{status}","acknowledged":{acknowledged},"verified":{acknowledged},"operation":"change-owners","crate_name":"foo","expires_at":"2099-01-01T00:00:00Z","localhost_port":null,"recommended_poll_interval_secs":1}}"#
+                r#"{{"challenge_id":"stp_owners","status":"{status}","acknowledged":{acknowledged},"verified":{acknowledged},"operation":"change-owners","crate_name":"foo","expires_at":"2099-01-01T00:00:00Z","localhost_port":null,"recommended_poll_interval_secs":1}}"#
             );
             Response {
                 code: 200,
@@ -255,12 +255,12 @@ fn api_mfa_required_then_retry() {
 
     p.cargo("owner -a username")
         .replace_crates_io(registry.index_url())
-        .env("CARGO_API_MFA_INTERACTIVE", "1")
+        .env("CARGO_STEP_UP_CHANNEL", "poll")
         .with_stderr_data(str![[r#"
 [UPDATING] crates.io index
-[NOTE] API MFA required; complete verification in your browser, then Cargo will retry
-[VERIFYING] please visit http://127.0.0.1:[..]/mfa/verify/mfa_owners (change-owners foo)
-[NOTE] API MFA acknowledged; retrying request
+[NOTE] additional authentication is required; complete verification in your browser, then Cargo will retry
+[VERIFYING] please visit http://127.0.0.1:[..]/verify/stp_owners (change-owners foo)
+[NOTE] step-up acknowledged; retrying request
 [OWNER] completed!
 
 "#]])
