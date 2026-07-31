@@ -4930,11 +4930,11 @@ fn step_up_callback_falls_back_to_poll_then_retry() {
             *n += 1;
             if *n == 1 {
                 assert!(
-                    req.crates_step_up_port.is_some(),
+                    req.cargo_step_up_port.is_some(),
                     "forced localhost channel should advertise a callback port"
                 );
                 assert!(
-                    req.crates_step_up_callback_secret.is_some(),
+                    req.cargo_step_up_callback_secret.is_some(),
                     "callback port must have listener state"
                 );
                 let origin = req.url.origin().ascii_serialization();
@@ -4991,7 +4991,7 @@ fn step_up_callback_falls_back_to_poll_then_retry() {
         .build();
 
     p.cargo("publish --no-verify --registry alternative")
-        .env("CARGO_STEP_UP_CHANNEL", "localhost")
+        .env("CARGO_REGISTRY_STEP_UP_CHANNEL", "localhost")
         .with_stderr_data(str![[r#"
 [UPDATING] `alternative` index
 [PACKAGING] foo v0.0.1 ([..]foo)
@@ -5199,7 +5199,7 @@ Caused by:
         .run();
 }
 
-/// Registry returns `step_up_required`; Cargo listens on localhost, receives OTP, retries with `Crates-OTP`.
+/// Registry returns `step_up_required`; Cargo receives a localhost proof and retries.
 #[cargo_test]
 fn step_up_localhost_otp_then_retry() {
     let publish_count = Arc::new(Mutex::new(0u32));
@@ -5218,15 +5218,15 @@ fn step_up_localhost_otp_then_retry() {
             *n += 1;
             if *n == 1 {
                 let port = req
-                    .crates_step_up_port
+                    .cargo_step_up_port
                     .as_deref()
                     .and_then(|p| p.parse::<u16>().ok())
-                    .expect("first publish should send Crates-Step-Up-Port");
+                    .expect("first publish should send Cargo-Step-Up-Port");
                 *seen_port.lock().unwrap() = Some(port);
                 let callback_secret = req
-                    .crates_step_up_callback_secret
+                    .cargo_step_up_callback_secret
                     .clone()
-                    .expect("first publish should send Crates-Step-Up-Callback-Secret");
+                    .expect("first publish should send Cargo-Step-Up-Callback-Secret");
                 assert_eq!(callback_secret.len(), 32);
                 *seen_callback_secret.lock().unwrap() = Some(callback_secret.clone());
                 // Simulate the verify page hitting `/?code=` on cargo's listener.
@@ -5236,7 +5236,7 @@ fn step_up_localhost_otp_then_retry() {
                         use std::io::Write;
                         let _ = write!(
                             stream,
-                            "GET /?code=TestOtp1&state={callback_secret} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
+                            "GET /?code=TestProof0123456789abcdef&state={callback_secret} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
                         );
                     }
                 });
@@ -5251,15 +5251,15 @@ fn step_up_localhost_otp_then_retry() {
                 }
             } else {
                 assert_eq!(
-                    req.crates_step_up_callback_secret,
+                    req.cargo_step_up_callback_secret,
                     *seen_callback_secret.lock().unwrap(),
                     "retry should preserve the callback secret"
                 );
-                *seen_otp.lock().unwrap() = req.crates_otp.clone();
+                *seen_otp.lock().unwrap() = req.cargo_step_up_proof.clone();
                 assert_eq!(
-                    req.crates_otp.as_deref(),
-                    Some("TestOtp1"),
-                    "retry should send Crates-OTP"
+                    req.cargo_step_up_proof.as_deref(),
+                    Some("TestProof0123456789abcdef"),
+                    "retry should send Cargo-Step-Up-Proof"
                 );
                 server.check_authorized_publish(req)
             }
@@ -5294,7 +5294,7 @@ fn step_up_localhost_otp_then_retry() {
 [UPLOADING] foo v0.0.1 ([..]foo)
 [NOTE] additional authentication is required; complete verification in your browser, then Cargo will retry
 [VERIFYING] please visit http://127.0.0.1:[..]/verify/stp_otp (publish foo)
-[NOTE] step-up OTP received; retrying request
+[NOTE] step-up proof received; retrying request
 [UPLOADED] foo v0.0.1 to registry `alternative`
 [NOTE] waiting for foo v0.0.1 to be available at registry `alternative`
 [HELP] you may press ctrl-c to skip waiting; the crate should be available shortly
@@ -5305,7 +5305,7 @@ fn step_up_localhost_otp_then_retry() {
 
     assert!(
         seen_port2.lock().unwrap().is_some_and(|p| p >= 1024),
-        "expected Crates-Step-Up-Port >= 1024"
+        "expected Cargo-Step-Up-Port >= 1024"
     );
     assert_eq!(
         seen_callback_secret2
@@ -5315,7 +5315,10 @@ fn step_up_localhost_otp_then_retry() {
             .map(str::len),
         Some(32)
     );
-    assert_eq!(seen_otp2.lock().unwrap().as_deref(), Some("TestOtp1"));
+    assert_eq!(
+        seen_otp2.lock().unwrap().as_deref(),
+        Some("TestProof0123456789abcdef")
+    );
 }
 
 /// Non-interactive / CI contexts fail fast on `step_up_required` (no poll wait).

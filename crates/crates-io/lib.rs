@@ -25,12 +25,10 @@ pub trait HttpClient {
     /// Like [`Self::request`], but HTTP redirects must not be followed.
     ///
     /// Used for step-up challenge polls so a same-origin `poll_url` cannot redirect
-    /// the client to loopback or other internal addresses. The default
-    /// implementation calls [`Self::request`]; production clients should override
-    /// this to disable redirect following.
-    fn request_no_redirect(&self, req: Request<Vec<u8>>) -> Result<Response<Vec<u8>>, Self::Error> {
-        self.request(req)
-    }
+    /// the client to loopback or other internal addresses.
+    ///
+    /// Implementations must perform the request with redirect following disabled.
+    fn request_no_redirect(&self, req: Request<Vec<u8>>) -> Result<Response<Vec<u8>>, Self::Error>;
 }
 
 pub struct Registry<T: HttpClient> {
@@ -43,22 +41,22 @@ pub struct Registry<T: HttpClient> {
     handle: T,
     /// Whether to include the authorization token with all requests.
     auth_required: bool,
-    /// Extra headers for interactive step-up (localhost port / OTP retry).
+    /// Extra headers for interactive step-up (localhost port / proof retry).
     step_up_headers: StepUpHeaders,
 }
 
 /// Optional headers for the registry interactive step-up handshake.
 ///
-/// When `port` is set, Cargo listens on `127.0.0.1:{port}` for a one-shot OTP
-/// from the registry verify page (`Crates-Step-Up-Port`). `callback_secret`
+/// When `port` is set, Cargo listens on `127.0.0.1:{port}` for a one-shot proof
+/// from the registry verify page (`Cargo-Step-Up-Port`). `callback_secret`
 /// authorizes callback port refreshes and is returned as listener callback
 /// state. Callback challenges remain pollable through an exact scoped grant.
-/// When the callback wins, the OTP is sent on retry as `Crates-OTP`.
+/// When the callback wins, the proof is sent on retry as `Cargo-Step-Up-Proof`.
 #[derive(Clone, Default)]
 pub struct StepUpHeaders {
     pub port: Option<u16>,
     pub callback_secret: Option<String>,
-    pub otp: Option<String>,
+    pub proof: Option<String>,
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -260,9 +258,9 @@ pub enum Error<T> {
     /// Registry requires interactive step-up (e.g. crates.io passkey).
     ///
     /// The CLI should print [`StepUpRequired::verification_url`], complete the
-    /// handshake via localhost OTP (preferred) or by polling
-    /// [`StepUpRequired::poll_url`], then retry the request (with `Crates-OTP`
-    /// when using the OTP path).
+    /// handshake via a localhost proof (preferred) or by polling
+    /// [`StepUpRequired::poll_url`], then retry the request (with
+    /// `Cargo-Step-Up-Proof` when using the callback path).
     #[error("{}", .0.detail)]
     StepUpRequired(StepUpRequired),
 
@@ -329,6 +327,9 @@ impl<T: HttpClient> Registry<T> {
     /// impl HttpClient for Client {
     ///     type Error = std::io::Error;
     ///     fn request(&self, req: Request<Vec<u8>>) -> Result<Response<Vec<u8>>, Self::Error> {
+    ///         todo!()
+    ///     }
+    ///     fn request_no_redirect(&self, req: Request<Vec<u8>>) -> Result<Response<Vec<u8>>, Self::Error> {
     ///         todo!()
     ///     }
     /// }
@@ -625,13 +626,13 @@ impl<T: HttpClient> Registry<T> {
 
     fn apply_step_up_headers(&self, mut request: http::request::Builder) -> http::request::Builder {
         if let Some(port) = self.step_up_headers.port {
-            request = request.header("Crates-Step-Up-Port", port.to_string());
+            request = request.header("Cargo-Step-Up-Port", port.to_string());
         }
         if let Some(secret) = self.step_up_headers.callback_secret.as_deref() {
-            request = request.header("Crates-Step-Up-Callback-Secret", secret);
+            request = request.header("Cargo-Step-Up-Callback-Secret", secret);
         }
-        if let Some(otp) = self.step_up_headers.otp.as_deref() {
-            request = request.header("Crates-OTP", otp);
+        if let Some(proof) = self.step_up_headers.proof.as_deref() {
+            request = request.header("Cargo-Step-Up-Proof", proof);
         }
         request
     }

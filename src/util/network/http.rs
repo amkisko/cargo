@@ -233,6 +233,32 @@ impl HandleConfiguration {
     }
 }
 
+fn starts_with_ignore_case(line: &str, text: &str) -> bool {
+    let line = line.as_bytes();
+    let text = text.as_bytes();
+    line[..line.len().min(text.len())].eq_ignore_ascii_case(text)
+}
+
+fn redact_http_header(line: &str) -> Option<&'static str> {
+    if starts_with_ignore_case(line, "authorization:") {
+        Some("Authorization: [REDACTED]")
+    } else if starts_with_ignore_case(line, "h2h3 [authorization:") {
+        Some("h2h3 [Authorization: [REDACTED]]")
+    } else if starts_with_ignore_case(line, "set-cookie") {
+        Some("set-cookie: [REDACTED]")
+    } else if starts_with_ignore_case(line, "cargo-step-up-callback-secret:") {
+        Some("Cargo-Step-Up-Callback-Secret: [REDACTED]")
+    } else if starts_with_ignore_case(line, "cargo-step-up-proof:") {
+        Some("Cargo-Step-Up-Proof: [REDACTED]")
+    } else if starts_with_ignore_case(line, "h2h3 [cargo-step-up-callback-secret:") {
+        Some("h2h3 [Cargo-Step-Up-Callback-Secret: [REDACTED]]")
+    } else if starts_with_ignore_case(line, "h2h3 [cargo-step-up-proof:") {
+        Some("h2h3 [Cargo-Step-Up-Proof: [REDACTED]]")
+    } else {
+        None
+    }
+}
+
 pub(crate) fn debug(kind: InfoType, data: &[u8]) {
     enum LogLevel {
         Debug,
@@ -248,20 +274,11 @@ pub(crate) fn debug(kind: InfoType, data: &[u8]) {
         InfoType::SslDataIn | InfoType::SslDataOut => return,
         _ => return,
     };
-    let starts_with_ignore_case = |line: &str, text: &str| -> bool {
-        let line = line.as_bytes();
-        let text = text.as_bytes();
-        line[..line.len().min(text.len())].eq_ignore_ascii_case(text)
-    };
     match str::from_utf8(data) {
         Ok(s) => {
             for mut line in s.lines() {
-                if starts_with_ignore_case(line, "authorization:") {
-                    line = "Authorization: [REDACTED]";
-                } else if starts_with_ignore_case(line, "h2h3 [authorization:") {
-                    line = "h2h3 [Authorization: [REDACTED]]";
-                } else if starts_with_ignore_case(line, "set-cookie") {
-                    line = "set-cookie: [REDACTED]";
+                if let Some(redacted) = redact_http_header(line) {
+                    line = redacted;
                 }
                 match level {
                     Debug => debug!(target: "network", "http-debug: {prefix} {line}"),
@@ -280,6 +297,24 @@ pub(crate) fn debug(kind: InfoType, data: &[u8]) {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::redact_http_header;
+
+    #[test]
+    fn redacts_step_up_credentials() {
+        assert_eq!(
+            redact_http_header("Cargo-Step-Up-Callback-Secret: secret"),
+            Some("Cargo-Step-Up-Callback-Secret: [REDACTED]")
+        );
+        assert_eq!(
+            redact_http_header("h2h3 [cargo-step-up-proof: proof]"),
+            Some("h2h3 [Cargo-Step-Up-Proof: [REDACTED]]")
+        );
+        assert_eq!(redact_http_header("Cargo-Step-Up-Port: 49152"), None);
     }
 }
 

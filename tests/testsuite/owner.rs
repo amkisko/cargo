@@ -255,7 +255,7 @@ fn step_up_required_then_retry() {
 
     p.cargo("owner -a username")
         .replace_crates_io(registry.index_url())
-        .env("CARGO_STEP_UP_CHANNEL", "poll")
+        .env("CARGO_REGISTRY_STEP_UP_CHANNEL", "poll")
         .with_stderr_data(str![[r#"
 [UPDATING] crates.io index
 [NOTE] additional authentication is required; complete verification in your browser, then Cargo will retry

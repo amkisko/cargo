@@ -1,6 +1,6 @@
 //! Handle registry interactive step-up challenges for publish, yank, and owner operations.
 //!
-//! When a registry returns `errors[].id == "step_up_required"`, Cargo prefers a localhost OTP
+//! When a registry returns `errors[].id == "step_up_required"`, Cargo prefers a localhost proof
 //! callback when it can bind `127.0.0.1`, and falls back to polling `poll_url` until acknowledged.
 //! Callback challenges remain pollable, so either channel can finish the handshake. See the
 //! registry web API docs.
@@ -49,16 +49,16 @@ const MAX_CALLBACK_REQUEST_LINE_BYTES: usize = 4 * 1024;
 const MAX_CALLBACK_HEADER_BYTES: usize = 16 * 1024;
 /// Maximum individual HTTP header-line size for localhost callbacks.
 const MAX_CALLBACK_HEADER_LINE_BYTES: usize = 8 * 1024;
-/// Accepted OTP length range for registry implementations.
-const MIN_OTP_LENGTH: usize = 8;
-const MAX_OTP_LENGTH: usize = 128;
+/// Accepted proof length range for registry implementations.
+const MIN_PROOF_LENGTH: usize = 22;
+const MAX_PROOF_LENGTH: usize = 128;
 /// Env override so tests / demos can force the localhost OTP path without a TTY.
 const PREFER_LOCALHOST_ENV: &str = "CARGO_STEP_UP_PREFER_LOCALHOST";
 /// Env override so tests can exercise the interactive handshake (poll or localhost)
 /// when stdin is not a TTY / `CI` is set.
 const INTERACTIVE_ENV: &str = "CARGO_STEP_UP_INTERACTIVE";
 /// Selects `auto`, `localhost`, `poll`, or `disabled` completion behavior.
-const CHANNEL_ENV: &str = "CARGO_STEP_UP_CHANNEL";
+const CHANNEL_ENV: &str = "CARGO_REGISTRY_STEP_UP_CHANNEL";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum StepUpChannel {
@@ -79,7 +79,7 @@ where
 {
     let channel = step_up_channel(gctx)?;
     let mut listener = maybe_start_otp_listener(gctx, channel);
-    let mut otp: Option<String> = None;
+    let mut proof: Option<String> = None;
     let mut handshakes = 0u32;
 
     let result = (|| {
@@ -87,7 +87,7 @@ where
             registry.set_step_up_headers(StepUpHeaders {
                 port: listener.as_ref().map(|l| l.port),
                 callback_secret: listener.as_ref().map(|l| l.callback_secret.clone()),
-                otp: otp.clone(),
+                proof: proof.clone(),
             });
             match op(registry) {
                 Ok(value) => return Ok(value),
@@ -118,7 +118,7 @@ where
                             timeout_hint(registry)
                         );
                     }
-                    otp = wait_for_step_up(gctx, registry, &step_up, listener.as_ref())?;
+                    proof = wait_for_step_up(gctx, registry, &step_up, listener.as_ref())?;
                 }
                 Err(err) => return Err(err.into()),
             }
@@ -206,7 +206,7 @@ fn wait_for_callback_or_poll(
         match listener.receiver.recv_timeout(remaining.min(interval)) {
             Ok(otp) => {
                 gctx.shell()
-                    .note("step-up OTP received; retrying request")?;
+                    .note("step-up proof received; retrying request")?;
                 return Ok(Some(otp));
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
@@ -444,7 +444,7 @@ fn timeout_hint(registry: &Registry<RegistryClient<'_>>) -> &'static str {
     }
 }
 
-/// Short-lived `127.0.0.1` HTTP listener that accepts a one-shot OTP callback.
+/// Short-lived `127.0.0.1` HTTP listener that accepts a one-shot proof callback.
 struct OtpListener {
     port: u16,
     callback_secret: String,
@@ -551,7 +551,7 @@ fn read_otp_from_request(stream: TcpStream, expected_callback_secret: &str) -> O
         .find(|(k, _)| k == "code" || k == "otp")
         .map(|(_, v)| v.into_owned())
         .filter(|otp| {
-            (MIN_OTP_LENGTH..=MAX_OTP_LENGTH).contains(&otp.len())
+            (MIN_PROOF_LENGTH..=MAX_PROOF_LENGTH).contains(&otp.len())
                 && otp
                     .bytes()
                     .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
@@ -610,12 +610,12 @@ mod tests {
     use std::time::Instant;
 
     #[test]
-    fn localhost_listener_accepts_valid_otp() {
+    fn localhost_listener_accepts_valid_proof() {
         let listener = OtpListener::bind().unwrap();
         let mut stream = TcpStream::connect(("127.0.0.1", listener.port)).unwrap();
         write!(
             stream,
-            "GET /?code=TestOtp1&state={} HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+            "GET /?code=TestProof0123456789abcdef&state={} HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
             listener.callback_secret
         )
         .unwrap();
@@ -625,7 +625,7 @@ mod tests {
                 .receiver
                 .recv_timeout(Duration::from_secs(2))
                 .unwrap(),
-            "TestOtp1"
+            "TestProof0123456789abcdef"
         );
         let mut response = String::new();
         stream.read_to_string(&mut response).unwrap();
@@ -635,7 +635,7 @@ mod tests {
     }
 
     #[test]
-    fn localhost_listener_ignores_invalid_otp_or_state() {
+    fn localhost_listener_ignores_invalid_proof_or_state() {
         let listener = OtpListener::bind().unwrap();
         let mut invalid = TcpStream::connect(("127.0.0.1", listener.port)).unwrap();
         write!(
@@ -649,7 +649,7 @@ mod tests {
         let mut wrong_state = TcpStream::connect(("127.0.0.1", listener.port)).unwrap();
         write!(
             wrong_state,
-            "GET /?code=PoisonOtp1&state=0123456789abcdef0123456789abcdef HTTP/1.1\r\n\
+            "GET /?code=PoisonProof0123456789abcdef&state=0123456789abcdef0123456789abcdef HTTP/1.1\r\n\
              Host: 127.0.0.1\r\n\r\n"
         )
         .unwrap();
@@ -658,7 +658,7 @@ mod tests {
         let mut valid = TcpStream::connect(("127.0.0.1", listener.port)).unwrap();
         write!(
             valid,
-            "GET /?code=TestOtp2&state={} HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+            "GET /?code=TestProof1123456789abcdef&state={} HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
             listener.callback_secret
         )
         .unwrap();
@@ -668,7 +668,7 @@ mod tests {
                 .receiver
                 .recv_timeout(Duration::from_secs(2))
                 .unwrap(),
-            "TestOtp2"
+            "TestProof1123456789abcdef"
         );
         listener.shutdown();
     }
@@ -679,7 +679,7 @@ mod tests {
         let mut stream = TcpStream::connect(("127.0.0.1", listener.port)).unwrap();
         write!(
             stream,
-            "GET /?code=TestOtp3&state={}",
+            "GET /?code=TestProof2123456789abcdef&state={}",
             listener.callback_secret
         )
         .unwrap();
