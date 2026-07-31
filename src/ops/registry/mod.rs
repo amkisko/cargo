@@ -164,10 +164,9 @@ fn registry<'gctx>(
         None
     };
     let handle = RegistryClient(gctx.http_async()?);
-    Ok((
-        Registry::new_handle(api_host, token, handle, cfg.auth_required),
-        src,
-    ))
+    let mut registry = Registry::new_handle(api_host, token, handle, cfg.auth_required);
+    registry.set_step_up_auth_version(cfg.step_up_auth);
+    Ok((registry, src))
 }
 
 /// Gets the `SourceId` for an index or registry setting.

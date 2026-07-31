@@ -5014,6 +5014,76 @@ fn step_up_callback_falls_back_to_poll_then_retry() {
     );
 }
 
+/// Version 1 registries receive a descriptor before Cargo uploads the archive.
+#[cargo_test]
+fn step_up_preflight_uploads_publish_body_once() {
+    let preflight_count = Arc::new(Mutex::new(0u32));
+    let publish_count = Arc::new(Mutex::new(0u32));
+    let preflight_count2 = preflight_count.clone();
+    let publish_count2 = publish_count.clone();
+
+    let _registry = RegistryBuilder::new()
+        .alternative()
+        .http_api()
+        .step_up_auth()
+        .add_responder("/api/v1/auth/challenges", move |req, _server| {
+            *preflight_count.lock().unwrap() += 1;
+            assert_eq!(req.method, "post");
+            assert!(req.cargo_mutation_id.is_none());
+            let descriptor: serde_json::Value =
+                serde_json::from_slice(req.body.as_deref().unwrap()).unwrap();
+            assert_eq!(descriptor["protocol_version"], 1);
+            assert_eq!(descriptor["operation"], "publish");
+            assert_eq!(descriptor["method"], "PUT");
+            assert_eq!(descriptor["endpoint"], "/api/v1/crates/new");
+            assert_eq!(descriptor["crate"], "foo");
+            assert_eq!(descriptor["version"], "0.0.1");
+            assert_eq!(descriptor["request_sha256"].as_str().unwrap().len(), 64);
+            assert_eq!(descriptor["archive_sha256"].as_str().unwrap().len(), 64);
+            assert!(
+                req.body.as_ref().unwrap().len()
+                    < descriptor["archive_size"].as_u64().unwrap() as usize,
+                "preflight must not contain the archive"
+            );
+            Response {
+                code: 200,
+                headers: vec!["Cache-Control: no-store".into()],
+                body: br#"{"status":"acknowledged","challenge_id":"stp_publish_once","expires_at":"2099-01-01T00:00:00Z"}"#.to_vec(),
+            }
+        })
+        .add_responder("/api/v1/crates/new", move |req, server| {
+            *publish_count.lock().unwrap() += 1;
+            assert_eq!(req.cargo_mutation_id.as_deref(), Some("stp_publish_once"));
+            server.check_authorized_publish(req)
+        })
+        .build();
+
+    let p = project()
+        .file(
+            "Cargo.toml",
+            r#"
+                [package]
+                name = "foo"
+                version = "0.0.1"
+                edition = "2015"
+                authors = []
+                license = "MIT"
+                description = "foo"
+            "#,
+        )
+        .file(
+            "src/lib.rs",
+            "pub fn large() -> &'static str { include_str!(\"large.txt\") }",
+        )
+        .file("src/large.txt", &"x".repeat(16 * 1024))
+        .build();
+
+    p.cargo("publish --no-verify --registry alternative").run();
+
+    assert_eq!(*preflight_count2.lock().unwrap(), 1);
+    assert_eq!(*publish_count2.lock().unwrap(), 1);
+}
+
 /// Cargo refuses HTTP redirects on step-up poll URLs (SSRF via Location).
 #[cargo_test]
 fn step_up_rejects_poll_redirect() {

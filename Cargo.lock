@@ -845,10 +845,12 @@ dependencies = [
 name = "crates-io"
 version = "0.41.2"
 dependencies = [
+ "hex",
  "http",
  "percent-encoding",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
  "thiserror 2.0.18",
  "url",
 ]

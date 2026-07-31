@@ -678,7 +678,13 @@ fn transmit(
         )
     })?;
 
-    let warnings = super::step_up::with_step_up_retry(gctx, registry, |registry| {
+    let descriptor = crates_io::MutationDescriptor::publish(
+        &new_crate.name,
+        &new_crate.vers,
+        &body,
+        tarball_len,
+    );
+    let warnings = super::step_up::with_step_up_retry(gctx, registry, descriptor, |registry| {
         registry.publish_body(&body, tarball_len)
     })
     .with_context(|| {

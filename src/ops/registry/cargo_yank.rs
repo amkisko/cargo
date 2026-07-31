@@ -59,7 +59,8 @@ pub fn yank(
     let package_spec = format!("{}@{}", name, version);
     if undo {
         gctx.shell().status("Unyank", package_spec)?;
-        super::step_up::with_step_up_retry(gctx, &mut registry, |registry| {
+        let descriptor = crates_io::MutationDescriptor::yank(&name, &version, true);
+        super::step_up::with_step_up_retry(gctx, &mut registry, descriptor, |registry| {
             registry.unyank(&name, &version)
         })
         .with_context(|| {
@@ -70,7 +71,8 @@ pub fn yank(
         })?;
     } else {
         gctx.shell().status("Yank", package_spec)?;
-        super::step_up::with_step_up_retry(gctx, &mut registry, |registry| {
+        let descriptor = crates_io::MutationDescriptor::yank(&name, &version, false);
+        super::step_up::with_step_up_retry(gctx, &mut registry, descriptor, |registry| {
             registry.yank(&name, &version)
         })
         .with_context(|| format!("failed to yank from the registry at {}", registry.host()))?;

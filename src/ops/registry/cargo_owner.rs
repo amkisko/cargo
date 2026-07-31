@@ -47,7 +47,8 @@ pub fn modify_owners(gctx: &GlobalContext, opts: &OwnersOptions) -> CargoResult<
 
     if let Some(ref v) = opts.to_add {
         let v = v.iter().map(|s| &s[..]).collect::<Vec<_>>();
-        let msg = super::step_up::with_step_up_retry(gctx, &mut registry, |registry| {
+        let descriptor = crates_io::MutationDescriptor::owners(&name, &v, true)?;
+        let msg = super::step_up::with_step_up_retry(gctx, &mut registry, descriptor, |registry| {
             registry.add_owners(&name, &v)
         })
         .with_context(|| {
@@ -65,7 +66,8 @@ pub fn modify_owners(gctx: &GlobalContext, opts: &OwnersOptions) -> CargoResult<
         let v = v.iter().map(|s| &s[..]).collect::<Vec<_>>();
         gctx.shell()
             .status("Owner", format!("removing {:?} from crate {}", v, name))?;
-        super::step_up::with_step_up_retry(gctx, &mut registry, |registry| {
+        let descriptor = crates_io::MutationDescriptor::owners(&name, &v, false)?;
+        super::step_up::with_step_up_retry(gctx, &mut registry, descriptor, |registry| {
             registry.remove_owners(&name, &v)
         })
         .with_context(|| {

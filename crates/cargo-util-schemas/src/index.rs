@@ -292,6 +292,13 @@ pub struct RegistryConfig {
     /// [RFC 3139]: https://rust-lang.github.io/rfcs/3139-cargo-alternative-registry-auth.html
     #[serde(default)]
     pub auth_required: bool,
+
+    /// Version of the registry step-up authentication protocol.
+    ///
+    /// Registries advertise this only after both mutation preflight and
+    /// idempotent mutation requests are supported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub step_up_auth: Option<u64>,
 }
 
 impl RegistryConfig {

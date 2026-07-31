@@ -16,6 +16,7 @@ use std::time::Instant;
 
 use anyhow::bail;
 use crates_io::Error as RegistryError;
+use crates_io::MutationDescriptor;
 use crates_io::Registry;
 use crates_io::StepUpHeaders;
 use crates_io::StepUpRequired;
@@ -72,7 +73,104 @@ enum StepUpChannel {
 pub(super) fn with_step_up_retry<T, F>(
     gctx: &GlobalContext,
     registry: &mut Registry<RegistryClient<'_>>,
+    descriptor: MutationDescriptor,
     mut op: F,
+) -> CargoResult<T>
+where
+    F: FnMut(&mut Registry<RegistryClient<'_>>) -> Result<T, RegistryError<http_async::Error>>,
+{
+    if registry.supports_step_up_preflight() {
+        return with_preflight(gctx, registry, descriptor, op);
+    }
+
+    with_reactive_step_up(gctx, registry, &mut op)
+}
+
+/// Preflights an exact mutation before transmitting its ordinary request body.
+fn with_preflight<T, F>(
+    gctx: &GlobalContext,
+    registry: &mut Registry<RegistryClient<'_>>,
+    descriptor: MutationDescriptor,
+    mut op: F,
+) -> CargoResult<T>
+where
+    F: FnMut(&mut Registry<RegistryClient<'_>>) -> Result<T, RegistryError<http_async::Error>>,
+{
+    let channel = step_up_channel(gctx)?;
+    let mut listener = maybe_start_otp_listener(gctx, channel);
+
+    let result = (|| {
+        registry.set_step_up_headers(StepUpHeaders {
+            port: listener.as_ref().map(|listener| listener.port),
+            callback_secret: listener
+                .as_ref()
+                .map(|listener| listener.callback_secret.clone()),
+            ..StepUpHeaders::default()
+        });
+
+        let (mutation_id, proof) = match registry.preflight_mutation(&descriptor) {
+            Ok(ready) => {
+                if ready.status != "acknowledged" {
+                    bail!(
+                        "registry returned unexpected preflight status `{}`",
+                        ready.status
+                    );
+                }
+                (ready.challenge_id, None)
+            }
+            Err(RegistryError::StepUpRequired(step_up)) => {
+                validate_step_up_url(registry, &step_up)?;
+                let detail = detail_for_user(
+                    &step_up.detail,
+                    registry.host(),
+                    listener
+                        .as_ref()
+                        .map(|listener| listener.callback_secret.as_str()),
+                )?;
+                if channel == StepUpChannel::Disabled {
+                    bail!(
+                        "additional authentication is required but step-up interaction is \\
+                         disabled by {CHANNEL_ENV}; {detail}"
+                    );
+                }
+                if is_noninteractive_step_up(gctx, channel) {
+                    bail!(
+                        "additional authentication is required but Cargo is running \
+                         non-interactively; {detail}"
+                    );
+                }
+                let proof = wait_for_step_up(gctx, registry, &step_up, &detail, listener.as_ref())?;
+                (step_up.challenge_id, proof)
+            }
+            Err(err) => return Err(err.into()),
+        };
+
+        registry.set_step_up_headers(StepUpHeaders {
+            proof,
+            mutation_id: Some(mutation_id),
+            ..StepUpHeaders::default()
+        });
+
+        // A single bounded retry covers an interrupted or response-ambiguous
+        // transport. The registry serializes and replays this mutation ID.
+        match op(registry) {
+            Err(RegistryError::Transport(_)) => op(registry).map_err(Into::into),
+            result => result.map_err(Into::into),
+        }
+    })();
+
+    registry.clear_step_up_headers();
+    if let Some(listener) = listener.take() {
+        listener.shutdown();
+    }
+    result
+}
+
+/// Compatibility path for registries that have not advertised preflight support.
+fn with_reactive_step_up<T, F>(
+    gctx: &GlobalContext,
+    registry: &mut Registry<RegistryClient<'_>>,
+    op: &mut F,
 ) -> CargoResult<T>
 where
     F: FnMut(&mut Registry<RegistryClient<'_>>) -> Result<T, RegistryError<http_async::Error>>,
@@ -82,50 +180,43 @@ where
     let mut proof: Option<String> = None;
     let mut handshakes = 0u32;
 
-    let result = (|| {
-        loop {
-            registry.set_step_up_headers(StepUpHeaders {
-                port: listener.as_ref().map(|l| l.port),
-                callback_secret: listener.as_ref().map(|l| l.callback_secret.clone()),
-                proof: proof.clone(),
-            });
-            match op(registry) {
-                Ok(value) => return Ok(value),
-                Err(RegistryError::StepUpRequired(step_up)) => {
-                    validate_step_up_url(registry, &step_up)?;
-                    let detail = detail_for_user(
-                        &step_up.detail,
-                        registry.host(),
-                        listener
-                            .as_ref()
-                            .map(|listener| listener.callback_secret.as_str()),
-                    )?;
-                    handshakes += 1;
-                    if handshakes > MAX_STEP_UP_HANDSHAKES {
-                        bail!(
-                            "exceeded {MAX_STEP_UP_HANDSHAKES} step-up handshake attempts; \
-                             {}",
-                            detail
-                        );
-                    }
-                    if channel == StepUpChannel::Disabled {
-                        bail!(
-                            "additional authentication is required but step-up interaction is \\
-                             disabled by {CHANNEL_ENV}; {}",
-                            detail
-                        );
-                    }
-                    if is_noninteractive_step_up(gctx, channel) {
-                        bail!(
-                            "additional authentication is required but Cargo is running \
-                             non-interactively; {}",
-                            detail
-                        );
-                    }
-                    proof = wait_for_step_up(gctx, registry, &step_up, &detail, listener.as_ref())?;
+    let result = (|| loop {
+        registry.set_step_up_headers(StepUpHeaders {
+            port: listener.as_ref().map(|l| l.port),
+            callback_secret: listener.as_ref().map(|l| l.callback_secret.clone()),
+            proof: proof.clone(),
+            mutation_id: None,
+        });
+        match op(registry) {
+            Ok(value) => return Ok(value),
+            Err(RegistryError::StepUpRequired(step_up)) => {
+                validate_step_up_url(registry, &step_up)?;
+                let detail = detail_for_user(
+                    &step_up.detail,
+                    registry.host(),
+                    listener
+                        .as_ref()
+                        .map(|listener| listener.callback_secret.as_str()),
+                )?;
+                handshakes += 1;
+                if handshakes > MAX_STEP_UP_HANDSHAKES {
+                    bail!("exceeded {MAX_STEP_UP_HANDSHAKES} step-up handshake attempts; {detail}");
                 }
-                Err(err) => return Err(err.into()),
+                if channel == StepUpChannel::Disabled {
+                    bail!(
+                        "additional authentication is required but step-up interaction is \\
+                         disabled by {CHANNEL_ENV}; {detail}"
+                    );
+                }
+                if is_noninteractive_step_up(gctx, channel) {
+                    bail!(
+                        "additional authentication is required but Cargo is running \
+                         non-interactively; {detail}"
+                    );
+                }
+                proof = wait_for_step_up(gctx, registry, &step_up, &detail, listener.as_ref())?;
             }
+            Err(err) => return Err(err.into()),
         }
     })();
 

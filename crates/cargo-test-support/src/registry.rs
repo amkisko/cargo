@@ -161,6 +161,8 @@ pub struct RegistryBuilder {
     token: Option<Token>,
     /// If set, the registry requires authorization for all operations.
     auth_required: bool,
+    /// Step-up protocol version advertised by index config.json.
+    step_up_auth: Option<u64>,
     /// If set, serves the index over http.
     http_index: bool,
     /// If set, serves the API over http.
@@ -242,6 +244,7 @@ impl RegistryBuilder {
             alternative: None,
             token: None,
             auth_required: false,
+            step_up_auth: None,
             http_api: false,
             http_index: false,
             api: true,
@@ -321,6 +324,13 @@ impl RegistryBuilder {
     #[must_use]
     pub fn auth_required(mut self) -> Self {
         self.auth_required = true;
+        self
+    }
+
+    /// Advertises idempotency-first registry step-up protocol version 1.
+    #[must_use]
+    pub fn step_up_auth(mut self) -> Self {
+        self.step_up_auth = Some(1);
         self
     }
 
@@ -517,6 +527,10 @@ impl RegistryBuilder {
         } else {
             ""
         };
+        let step_up_auth = self
+            .step_up_auth
+            .map(|version| format!(r#","step-up-auth":{version}"#))
+            .unwrap_or_default();
         let api = if self.api {
             format!(r#","api":"{}""#, registry.api_url)
         } else {
@@ -526,7 +540,7 @@ impl RegistryBuilder {
         repo(&registry.path)
             .file(
                 "config.json",
-                &format!(r#"{{"dl":"{}"{api}{auth}}}"#, registry.dl_url),
+                &format!(r#"{{"dl":"{}"{api}{auth}{step_up_auth}}}"#, registry.dl_url),
             )
             .build();
         fs::create_dir_all(api_path.join("api/v1/crates")).unwrap();
@@ -689,6 +703,8 @@ pub struct Request {
     pub cargo_step_up_callback_secret: Option<String>,
     /// `Cargo-Step-Up-Proof` when present (interactive step-up retry).
     pub cargo_step_up_proof: Option<String>,
+    /// `Cargo-Mutation-Id` when present on an idempotent mutation.
+    pub cargo_mutation_id: Option<String>,
 }
 
 impl fmt::Debug for Request {
@@ -702,6 +718,7 @@ impl fmt::Debug for Request {
             .field("if_none_match", &self.if_none_match)
             .field("cargo_step_up_port", &self.cargo_step_up_port)
             .field("cargo_step_up_proof", &self.cargo_step_up_proof)
+            .field("cargo_mutation_id", &self.cargo_mutation_id)
             .finish()
     }
 }
@@ -796,6 +813,7 @@ impl HttpServer {
             let mut cargo_step_up_port = None;
             let mut cargo_step_up_callback_secret = None;
             let mut cargo_step_up_proof = None;
+            let mut cargo_mutation_id = None;
             let mut content_len = None;
             loop {
                 line.clear();
@@ -817,6 +835,7 @@ impl HttpServer {
                     "cargo-step-up-port" => cargo_step_up_port = Some(value),
                     "cargo-step-up-callback-secret" => cargo_step_up_callback_secret = Some(value),
                     "cargo-step-up-proof" => cargo_step_up_proof = Some(value),
+                    "cargo-mutation-id" => cargo_mutation_id = Some(value),
                     "content-length" => content_len = Some(value),
                     _ => {}
                 }
@@ -837,6 +856,7 @@ impl HttpServer {
                 cargo_step_up_port,
                 cargo_step_up_callback_secret,
                 cargo_step_up_proof,
+                cargo_mutation_id,
                 method,
                 url,
                 body,

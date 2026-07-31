@@ -10,6 +10,7 @@ use std::time::Instant;
 use http::{Method, Request, Response, StatusCode};
 use percent_encoding::{NON_ALPHANUMERIC, percent_encode};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use url::Url;
 
 type RegistryResult<T, E> = Result<T, Error<E>>;
@@ -41,6 +42,8 @@ pub struct Registry<T: HttpClient> {
     handle: T,
     /// Whether to include the authorization token with all requests.
     auth_required: bool,
+    /// Advertised version of the idempotency-first step-up protocol.
+    step_up_auth_version: Option<u64>,
     /// Extra headers for interactive step-up (localhost port / proof retry).
     step_up_headers: StepUpHeaders,
 }
@@ -57,6 +60,114 @@ pub struct StepUpHeaders {
     pub port: Option<u16>,
     pub callback_secret: Option<String>,
     pub proof: Option<String>,
+    pub mutation_id: Option<String>,
+}
+
+/// Exact mutation descriptor sent before an idempotency-first registry mutation.
+#[derive(Debug, Clone, Serialize)]
+pub struct MutationDescriptor {
+    protocol_version: u64,
+    operation: String,
+    method: String,
+    endpoint: String,
+    #[serde(rename = "crate")]
+    crate_name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    version: Option<String>,
+    request_sha256: String,
+    request_size: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    archive_sha256: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    archive_size: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    direction: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    owners: Option<Vec<String>>,
+}
+
+impl MutationDescriptor {
+    fn base(
+        operation: &str,
+        method: Method,
+        endpoint: String,
+        crate_name: &str,
+        request_body: &[u8],
+    ) -> Self {
+        Self {
+            protocol_version: 1,
+            operation: operation.to_owned(),
+            method: method.as_str().to_owned(),
+            endpoint,
+            crate_name: crate_name.to_owned(),
+            version: None,
+            request_sha256: hex::encode(Sha256::digest(request_body)),
+            request_size: request_body.len() as u64,
+            archive_sha256: None,
+            archive_size: None,
+            direction: None,
+            owners: None,
+        }
+    }
+
+    /// Describes an ordinary publish request using its already-buffered bytes.
+    pub fn publish(crate_name: &str, version: &str, body: &[u8], archive_size: u64) -> Self {
+        let archive_start = body
+            .len()
+            .checked_sub(archive_size as usize)
+            .expect("archive size must not exceed publish body size");
+        let mut descriptor = Self::base(
+            "publish",
+            Method::PUT,
+            "/api/v1/crates/new".to_owned(),
+            crate_name,
+            body,
+        );
+        descriptor.version = Some(version.to_owned());
+        descriptor.archive_sha256 = Some(hex::encode(Sha256::digest(&body[archive_start..])));
+        descriptor.archive_size = Some(archive_size);
+        descriptor
+    }
+
+    /// Describes a bodyless yank or unyank request.
+    pub fn yank(crate_name: &str, version: &str, undo: bool) -> Self {
+        let operation = if undo { "unyank" } else { "yank" };
+        let action = if undo { "unyank" } else { "yank" };
+        let method = if undo { Method::PUT } else { Method::DELETE };
+        let mut descriptor = Self::base(
+            operation,
+            method,
+            format!("/api/v1/crates/{crate_name}/{version}/{action}"),
+            crate_name,
+            &[],
+        );
+        descriptor.version = Some(version.to_owned());
+        descriptor
+    }
+
+    /// Describes an owner mutation and the exact JSON bytes Cargo will send.
+    pub fn owners(crate_name: &str, owners: &[&str], add: bool) -> Result<Self, serde_json::Error> {
+        let body = serde_json::to_vec(&OwnersReq { users: owners })?;
+        let method = if add { Method::PUT } else { Method::DELETE };
+        let mut descriptor = Self::base(
+            "change-owners",
+            method,
+            format!("/api/v1/crates/{crate_name}/owners"),
+            crate_name,
+            &body,
+        );
+        descriptor.direction = Some(if add { "add" } else { "remove" }.to_owned());
+        descriptor.owners = Some(owners.iter().map(|owner| (*owner).to_owned()).collect());
+        Ok(descriptor)
+    }
+}
+
+/// A mutation record returned by a successful preflight.
+#[derive(Debug, Clone, Deserialize)]
+pub struct StepUpReady {
+    pub status: String,
+    pub challenge_id: String,
+    pub expires_at: Option<String>,
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -337,8 +448,19 @@ impl<T: HttpClient> Registry<T> {
             token,
             handle,
             auth_required,
+            step_up_auth_version: None,
             step_up_headers: StepUpHeaders::default(),
         }
+    }
+
+    /// Sets the step-up protocol version advertised by registry `config.json`.
+    pub fn set_step_up_auth_version(&mut self, version: Option<u64>) {
+        self.step_up_auth_version = version;
+    }
+
+    /// Whether this registry advertises idempotency-first step-up version 1.
+    pub fn supports_step_up_preflight(&self) -> bool {
+        self.step_up_auth_version == Some(1)
     }
 
     pub fn set_token(&mut self, token: Option<String>) {
@@ -353,6 +475,21 @@ impl<T: HttpClient> Registry<T> {
     /// Clears step-up headers after a successful mutate or when abandoning a handshake.
     pub fn clear_step_up_headers(&mut self) {
         self.step_up_headers = StepUpHeaders::default();
+    }
+
+    /// Creates or reuses the mutation record for an exact mutation descriptor.
+    pub fn preflight_mutation(
+        &mut self,
+        descriptor: &MutationDescriptor,
+    ) -> RegistryResult<StepUpReady, T::Error> {
+        let body = serde_json::to_vec(descriptor)?;
+        let response = self.req(
+            Method::POST,
+            "/auth/challenges",
+            Some(&body),
+            Auth::Authorized,
+        )?;
+        Ok(serde_json::from_str(&response)?)
     }
 
     fn token(&self) -> RegistryResult<&str, T::Error> {
@@ -622,6 +759,9 @@ impl<T: HttpClient> Registry<T> {
         }
         if let Some(proof) = self.step_up_headers.proof.as_deref() {
             request = request.header("Cargo-Step-Up-Proof", proof);
+        }
+        if let Some(mutation_id) = self.step_up_headers.mutation_id.as_deref() {
+            request = request.header("Cargo-Mutation-Id", mutation_id);
         }
         request
     }
