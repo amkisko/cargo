@@ -19,6 +19,15 @@
       "description": "Whether all operations require authentication. See [RFC 3139].\n\n[RFC 3139]: https://rust-lang.github.io/rfcs/3139-cargo-alternative-registry-auth.html",
       "type": "boolean",
       "default": false
+    },
+    "step-up-auth": {
+      "description": "Version of the registry step-up authentication protocol.\n\nRegistries advertise this only after both mutation preflight and\nidempotent mutation requests are supported.",
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint64",
+      "minimum": 0
     }
   },
   "required": [
