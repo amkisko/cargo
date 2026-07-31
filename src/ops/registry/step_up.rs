@@ -122,13 +122,7 @@ where
                             detail
                         );
                     }
-                    proof = wait_for_step_up(
-                        gctx,
-                        registry,
-                        &step_up,
-                        &detail,
-                        listener.as_ref(),
-                    )?;
+                    proof = wait_for_step_up(gctx, registry, &step_up, &detail, listener.as_ref())?;
                 }
                 Err(err) => return Err(err.into()),
             }
@@ -153,14 +147,7 @@ fn wait_for_step_up(
 
     let timeout = timeout_from_expires_at(step_up.expires_at.as_deref());
     if let Some(listener) = listener {
-        return wait_for_callback_or_poll(
-            gctx,
-            registry,
-            step_up,
-            detail,
-            listener,
-            timeout,
-        );
+        return wait_for_callback_or_poll(gctx, registry, step_up, detail, listener, timeout);
     }
 
     wait_for_poll_ack(gctx, registry, step_up, detail, timeout)?;
@@ -296,10 +283,7 @@ fn wait_for_poll_ack(
     loop {
         let elapsed = started.elapsed();
         if elapsed > timeout {
-            bail!(
-                "timed out waiting for step-up acknowledgment; {}",
-                detail
-            );
+            bail!("timed out waiting for step-up acknowledgment; {}", detail);
         }
         let sleep_for = interval.min(timeout.saturating_sub(elapsed));
         if !sleep_for.is_zero() {
@@ -308,10 +292,7 @@ fn wait_for_poll_ack(
 
         let elapsed = started.elapsed();
         if elapsed > timeout {
-            bail!(
-                "timed out waiting for step-up acknowledgment; {}",
-                detail
-            );
+            bail!("timed out waiting for step-up acknowledgment; {}", detail);
         }
         progress.tick_now(
             elapsed.as_secs().min(max as u64) as usize,

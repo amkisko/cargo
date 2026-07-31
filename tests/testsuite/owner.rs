@@ -211,7 +211,7 @@ fn step_up_required_then_retry() {
             if *n == 1 {
                 let origin = req.url.origin().ascii_serialization();
                 let body = format!(
-                    r#"{{"errors":[{{"detail":"Additional authentication is required","id":"step_up_required","protocol_version":1,"interaction":"browser","challenge_id":"stp_owners","operation":"change-owners","crate":"foo","verification_url":"{origin}/verify/stp_owners","poll_url":"{origin}/api/v1/auth/challenges/stp_owners","expires_at":"2099-01-01T00:00:00Z","recommended_poll_interval_secs":1}}]}}"#
+                    r#"{{"errors":[{{"detail":"Additional authentication is required. Visit {origin}/verify/stp_owners.","id":"step_up_required","protocol_version":1,"challenge_id":"stp_owners","operation":"change-owners","crate":"foo","poll_url":"{origin}/api/v1/auth/challenges/stp_owners","expires_at":"2099-01-01T00:00:00Z","recommended_poll_interval_secs":1}}]}}"#
                 );
                 Response {
                     code: 403,
@@ -258,8 +258,7 @@ fn step_up_required_then_retry() {
         .env("CARGO_REGISTRY_STEP_UP_CHANNEL", "poll")
         .with_stderr_data(str![[r#"
 [UPDATING] crates.io index
-[NOTE] additional authentication is required; complete verification in your browser, then Cargo will retry
-[VERIFYING] please visit http://127.0.0.1:[..]/verify/stp_owners (change-owners foo)
+[NOTE] Additional authentication is required. Visit http://127.0.0.1:[..]/verify/stp_owners.
 [NOTE] step-up acknowledged; retrying request
 [OWNER] completed!
 

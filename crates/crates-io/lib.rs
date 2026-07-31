@@ -174,7 +174,8 @@ struct ApiError {
 #[derive(Debug, Clone)]
 pub struct StepUpRequired {
     pub detail: String,
-    pub challenge_id: Option<String>,
+    /// Canonical mutation id returned by preflight.
+    pub challenge_id: String,
     /// Version of the step-up wire contract.
     pub protocol_version: u64,
     pub operation: Option<String>,
@@ -670,9 +671,10 @@ fn step_up_required_from_api_error(err: &ApiError) -> Option<StepUpRequired> {
         return None;
     }
     let poll_url = err.poll_url.clone()?;
+    let challenge_id = err.challenge_id.clone()?;
     Some(StepUpRequired {
         detail: err.detail.clone(),
-        challenge_id: err.challenge_id.clone(),
+        challenge_id,
         protocol_version: 1,
         operation: err.operation.clone(),
         crate_name: err.crate_name.clone(),
@@ -808,6 +810,10 @@ mod tests {
         let mut missing_poll_url = valid_step_up_error();
         missing_poll_url.poll_url = None;
         assert!(step_up_required_from_api_error(&missing_poll_url).is_none());
+
+        let mut missing_challenge_id = valid_step_up_error();
+        missing_challenge_id.challenge_id = None;
+        assert!(step_up_required_from_api_error(&missing_challenge_id).is_none());
     }
 
     fn valid_step_up_error() -> ApiError {
@@ -815,6 +821,7 @@ mod tests {
             detail: "Additional authentication is required".into(),
             id: Some("step_up_required".into()),
             protocol_version: Some(1),
+            challenge_id: Some("stp_x".into()),
             poll_url: Some("https://crates.io/api/v1/auth/challenges/stp_x".into()),
             ..ApiError::default()
         }
