@@ -1,10 +1,9 @@
-//! Handle registry interactive step-up challenges for publish / yank / owners.
+//! Handle registry interactive step-up challenges for publish, yank, and owner operations.
 //!
-//! When a registry returns `errors[].id == "step_up_required"`, Cargo prefers a
-//! localhost OTP callback when it can bind `127.0.0.1`, and falls
-//! back to polling `poll_url` until acknowledged. Callback challenges remain
-//! pollable, so either channel can finish the handshake. See the registry web API
-//! docs.
+//! When a registry returns `errors[].id == "step_up_required"`, Cargo prefers a localhost OTP
+//! callback when it can bind `127.0.0.1`, and falls back to polling `poll_url` until acknowledged.
+//! Callback challenges remain pollable, so either channel can finish the handshake. See the
+//! registry web API docs.
 
 use std::io::{BufRead, BufReader, IsTerminal, Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};

@@ -49,7 +49,7 @@ pub struct Registry<T: HttpClient> {
 
 /// Optional headers for the registry interactive step-up handshake.
 ///
-/// When `port` is set, cargo listens on `127.0.0.1:{port}` for a one-shot OTP
+/// When `port` is set, Cargo listens on `127.0.0.1:{port}` for a one-shot OTP
 /// from the registry verify page (`Crates-Step-Up-Port`). `callback_secret`
 /// authorizes callback port refreshes and is returned as listener callback
 /// state. Callback challenges remain pollable through an exact scoped grant.
