@@ -154,7 +154,20 @@ where
         // A single bounded retry covers an interrupted or response-ambiguous
         // transport. The registry serializes and replays this mutation ID.
         match op(registry) {
-            Err(RegistryError::Transport(_)) => op(registry).map_err(Into::into),
+            Err(RegistryError::Transport(_) | RegistryError::Timeout(_)) => {
+                op(registry).map_err(Into::into)
+            }
+            Err(RegistryError::Code { code, .. } | RegistryError::Api { code, .. })
+                if matches!(
+                    code,
+                    http::StatusCode::REQUEST_TIMEOUT
+                        | http::StatusCode::BAD_GATEWAY
+                        | http::StatusCode::SERVICE_UNAVAILABLE
+                        | http::StatusCode::GATEWAY_TIMEOUT
+                ) =>
+            {
+                op(registry).map_err(Into::into)
+            }
             result => result.map_err(Into::into),
         }
     })();

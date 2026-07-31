@@ -165,8 +165,11 @@ impl MutationDescriptor {
 /// A mutation record returned by a successful preflight.
 #[derive(Debug, Clone, Deserialize)]
 pub struct StepUpReady {
+    /// Must be `acknowledged` before Cargo sends the mutation.
     pub status: String,
+    /// Canonical mutation ID to send on the final request and retries.
     pub challenge_id: String,
+    /// End of the mutation record's advertised replay lifetime.
     pub expires_at: Option<String>,
 }
 
@@ -906,9 +909,10 @@ pub fn check_token(token: &str) -> Result<(), TokenError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ApiError, StepUpHeaders, redact_step_up_credentials, step_up_required_from_api_error,
-        url_shares_origin_with_registry,
+        ApiError, MutationDescriptor, StepUpHeaders, redact_step_up_credentials,
+        step_up_required_from_api_error, url_shares_origin_with_registry,
     };
+    use sha2::{Digest, Sha256};
 
     #[test]
     fn step_up_poll_url_same_origin() {
@@ -996,6 +1000,41 @@ mod tests {
         assert_eq!(
             redact_step_up_credentials(body, &headers),
             "[REDACTED] and [REDACTED]"
+        );
+    }
+
+    #[test]
+    fn publish_descriptor_hashes_exact_body_and_archive() {
+        let mut body = b"metadata-prefix".to_vec();
+        body.extend_from_slice(b"archive");
+        let descriptor = MutationDescriptor::publish("demo", "1.2.3", &body, 7);
+        let descriptor = serde_json::to_value(descriptor).unwrap();
+
+        assert_eq!(descriptor["request_size"], body.len());
+        assert_eq!(
+            descriptor["request_sha256"],
+            hex::encode(Sha256::digest(&body))
+        );
+        assert_eq!(descriptor["archive_size"], 7);
+        assert_eq!(
+            descriptor["archive_sha256"],
+            hex::encode(Sha256::digest(b"archive"))
+        );
+    }
+
+    #[test]
+    fn owner_descriptor_hashes_the_mutation_json() {
+        let owners = ["alice", "github:org:team"];
+        let descriptor = MutationDescriptor::owners("demo", &owners, true).unwrap();
+        let descriptor = serde_json::to_value(descriptor).unwrap();
+        let body = br#"{"users":["alice","github:org:team"]}"#;
+
+        assert_eq!(descriptor["direction"], "add");
+        assert_eq!(descriptor["owners"], serde_json::json!(owners));
+        assert_eq!(descriptor["request_size"], body.len());
+        assert_eq!(
+            descriptor["request_sha256"],
+            hex::encode(Sha256::digest(body))
         );
     }
 }
