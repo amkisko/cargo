@@ -4997,7 +4997,7 @@ fn step_up_callback_falls_back_to_poll_then_retry() {
 [PACKAGING] foo v0.0.1 ([..]foo)
 [PACKAGED] 4 files, [FILE_SIZE]B ([FILE_SIZE]B compressed)
 [UPLOADING] foo v0.0.1 ([..]foo)
-[NOTE] Additional authentication is required. Visit http://127.0.0.1:[..]/verify/stp_testop.
+[NOTE] Additional authentication is required. Visit http://127.0.0.1:[..]/verify/stp_testop#callback_secret=[..].
 [NOTE] step-up acknowledged; retrying request
 [UPLOADED] foo v0.0.1 to registry `alternative`
 [NOTE] waiting for foo v0.0.1 to be available at registry `alternative`
@@ -5009,10 +5009,8 @@ fn step_up_callback_falls_back_to_poll_then_retry() {
 
     let auths = poll_auths2.lock().unwrap();
     assert!(
-        auths
-            .iter()
-            .all(|a| a.as_ref().is_some_and(|t| !t.is_empty())),
-        "step-up poll requests should include Authorization: {auths:?}"
+        auths.iter().all(Option::is_none),
+        "step-up poll requests must not include a mutation credential: {auths:?}"
     );
 }
 
@@ -5289,7 +5287,7 @@ fn step_up_localhost_otp_then_retry() {
 [PACKAGING] foo v0.0.1 ([..]foo)
 [PACKAGED] 4 files, [FILE_SIZE]B ([FILE_SIZE]B compressed)
 [UPLOADING] foo v0.0.1 ([..]foo)
-[NOTE] Additional authentication is required. Visit http://127.0.0.1:[..]/verify/stp_otp.
+[NOTE] Additional authentication is required. Visit http://127.0.0.1:[..]/verify/stp_otp#callback_secret=[..].
 [NOTE] step-up proof received; retrying request
 [UPLOADED] foo v0.0.1 to registry `alternative`
 [NOTE] waiting for foo v0.0.1 to be available at registry `alternative`

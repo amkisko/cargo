@@ -155,8 +155,6 @@ struct ApiError {
     #[serde(default)]
     protocol_version: Option<u64>,
     #[serde(default)]
-    verification_url: Option<String>,
-    #[serde(default)]
     poll_url: Option<String>,
     #[serde(default)]
     recommended_poll_interval_secs: Option<u64>,
@@ -164,8 +162,6 @@ struct ApiError {
     expires_at: Option<String>,
     #[serde(default)]
     challenge_id: Option<String>,
-    #[serde(default)]
-    interaction: Option<String>,
     #[serde(default)]
     operation: Option<String>,
     #[serde(default, rename = "crate")]
@@ -181,11 +177,8 @@ pub struct StepUpRequired {
     pub challenge_id: Option<String>,
     /// Version of the step-up wire contract.
     pub protocol_version: u64,
-    /// How the client should proceed. Version 1 requires `"browser"`.
-    pub interaction: String,
     pub operation: Option<String>,
     pub crate_name: Option<String>,
-    pub verification_url: String,
     pub poll_url: String,
     pub recommended_poll_interval_secs: Option<u64>,
     pub expires_at: Option<String>,
@@ -257,8 +250,8 @@ pub enum Error<T> {
 
     /// Registry requires interactive step-up (e.g. crates.io passkey).
     ///
-    /// The CLI should print [`StepUpRequired::verification_url`], complete the
-    /// handshake via a localhost proof (preferred) or by polling
+    /// The CLI should print [`StepUpRequired::detail`], complete the handshake
+    /// via a localhost proof (preferred) or by polling
     /// [`StepUpRequired::poll_url`], then retry the request (with
     /// `Cargo-Step-Up-Proof` when using the callback path).
     #[error("{}", .0.detail)]
@@ -545,15 +538,10 @@ impl<T: HttpClient> Registry<T> {
             });
         }
 
-        let mut request = http::Request::builder()
+        let request = http::Request::builder()
             .method(Method::GET)
             .uri(poll_url)
             .header(http::header::ACCEPT, "application/json");
-        if let Some(token) = self.token.as_deref() {
-            if check_token(token).is_ok() {
-                request = request.header(http::header::AUTHORIZATION, token);
-            }
-        }
         let request = request.body(Vec::new())?;
         let response = self
             .handle
@@ -678,22 +666,16 @@ impl<T: HttpClient> Registry<T> {
 }
 
 fn step_up_required_from_api_error(err: &ApiError) -> Option<StepUpRequired> {
-    if err.id.as_deref() != Some("step_up_required")
-        || err.protocol_version != Some(1)
-        || err.interaction.as_deref() != Some("browser")
-    {
+    if err.id.as_deref() != Some("step_up_required") || err.protocol_version != Some(1) {
         return None;
     }
-    let verification_url = err.verification_url.clone()?;
     let poll_url = err.poll_url.clone()?;
     Some(StepUpRequired {
         detail: err.detail.clone(),
         challenge_id: err.challenge_id.clone(),
         protocol_version: 1,
-        interaction: "browser".into(),
         operation: err.operation.clone(),
         crate_name: err.crate_name.clone(),
-        verification_url,
         poll_url,
         recommended_poll_interval_secs: err.recommended_poll_interval_secs,
         expires_at: err.expires_at.clone(),
@@ -802,12 +784,11 @@ mod tests {
     }
 
     #[test]
-    fn step_up_required_parses_version_one_browser_contract() {
+    fn step_up_required_parses_version_one_contract() {
         let error = valid_step_up_error();
         let step_up = step_up_required_from_api_error(&error).unwrap();
         assert_eq!(step_up.protocol_version, 1);
-        assert_eq!(step_up.interaction, "browser");
-        assert_eq!(step_up.verification_url, "https://crates.io/verify/stp_x");
+        assert_eq!(step_up.detail, "Additional authentication is required");
         assert_eq!(
             step_up.poll_url,
             "https://crates.io/api/v1/auth/challenges/stp_x"
@@ -824,10 +805,6 @@ mod tests {
         unknown_version.protocol_version = Some(2);
         assert!(step_up_required_from_api_error(&unknown_version).is_none());
 
-        let mut unknown_interaction = valid_step_up_error();
-        unknown_interaction.interaction = Some("device-code".into());
-        assert!(step_up_required_from_api_error(&unknown_interaction).is_none());
-
         let mut missing_poll_url = valid_step_up_error();
         missing_poll_url.poll_url = None;
         assert!(step_up_required_from_api_error(&missing_poll_url).is_none());
@@ -838,8 +815,6 @@ mod tests {
             detail: "Additional authentication is required".into(),
             id: Some("step_up_required".into()),
             protocol_version: Some(1),
-            interaction: Some("browser".into()),
-            verification_url: Some("https://crates.io/verify/stp_x".into()),
             poll_url: Some("https://crates.io/api/v1/auth/challenges/stp_x".into()),
             ..ApiError::default()
         }

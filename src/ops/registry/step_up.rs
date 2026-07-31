@@ -92,9 +92,10 @@ where
             match op(registry) {
                 Ok(value) => return Ok(value),
                 Err(RegistryError::StepUpRequired(step_up)) => {
-                    validate_step_up_urls(registry, &step_up)?;
-                    let verification_url = verification_url_for_user(
-                        &step_up.verification_url,
+                    validate_step_up_url(registry, &step_up)?;
+                    let detail = detail_for_user(
+                        &step_up.detail,
+                        registry.host(),
                         listener
                             .as_ref()
                             .map(|listener| listener.callback_secret.as_str()),
@@ -103,32 +104,29 @@ where
                     if handshakes > MAX_STEP_UP_HANDSHAKES {
                         bail!(
                             "exceeded {MAX_STEP_UP_HANDSHAKES} step-up handshake attempts; \
-                             visit {} and retry, or complete additional authentication with your registry",
-                            verification_url
+                             {}",
+                            detail
                         );
                     }
                     if channel == StepUpChannel::Disabled {
                         bail!(
                             "additional authentication is required but step-up interaction is \\
-                             disabled by {CHANNEL_ENV}; visit {} and retry from an interactive session{}",
-                            verification_url,
-                            timeout_hint(registry)
+                             disabled by {CHANNEL_ENV}; {}",
+                            detail
                         );
                     }
                     if is_noninteractive_step_up(gctx, channel) {
                         bail!(
                             "additional authentication is required but Cargo is running \
-                             non-interactively; visit {} from an interactive session, \
-                             use Trusted Publishing{}",
-                            verification_url,
-                            timeout_hint(registry)
+                             non-interactively; {}",
+                            detail
                         );
                     }
                     proof = wait_for_step_up(
                         gctx,
                         registry,
                         &step_up,
-                        &verification_url,
+                        &detail,
                         listener.as_ref(),
                     )?;
                 }
@@ -148,18 +146,10 @@ fn wait_for_step_up(
     gctx: &GlobalContext,
     registry: &mut Registry<RegistryClient<'_>>,
     step_up: &StepUpRequired,
-    verification_url: &str,
+    detail: &str,
     listener: Option<&OtpListener>,
 ) -> CargoResult<Option<String>> {
-    gctx.shell().note(
-        "additional authentication is required; complete verification in your browser, \
-         then Cargo will retry",
-    )?;
-    let context = step_up_context_label(step_up);
-    gctx.shell().status(
-        "Verifying",
-        format!("please visit {verification_url}{context}"),
-    )?;
+    gctx.shell().note(detail)?;
 
     let timeout = timeout_from_expires_at(step_up.expires_at.as_deref());
     if let Some(listener) = listener {
@@ -167,49 +157,58 @@ fn wait_for_step_up(
             gctx,
             registry,
             step_up,
-            verification_url,
+            detail,
             listener,
             timeout,
         );
     }
 
-    wait_for_poll_ack(gctx, registry, step_up, verification_url, timeout)?;
+    wait_for_poll_ack(gctx, registry, step_up, detail, timeout)?;
     Ok(None)
 }
 
-/// Adds client-held callback state to the browser URL without sending it back
-/// through the registry response body.
-fn verification_url_for_user(
-    verification_url: &str,
+/// Adds client-held callback state to the first same-origin URL in the
+/// registry's human-readable instructions.
+fn detail_for_user(
+    detail: &str,
+    registry_host: &str,
     callback_secret: Option<&str>,
 ) -> CargoResult<String> {
     let Some(callback_secret) = callback_secret else {
-        return Ok(verification_url.to_owned());
+        return Ok(detail.to_owned());
     };
 
-    let mut url = Url::parse(verification_url)?;
-    if url.fragment().is_some() {
-        bail!("step-up verification URL must not contain a fragment");
+    for word in detail.split_whitespace() {
+        let candidate = word.trim_matches(|character: char| {
+            matches!(
+                character,
+                '(' | ')' | '[' | ']' | '<' | '>' | ',' | ';' | '.' | '!'
+            )
+        });
+        let Ok(mut url) = Url::parse(candidate) else {
+            continue;
+        };
+        if !crates_io::url_shares_origin_with_registry(candidate, registry_host) {
+            continue;
+        }
+        if url.fragment().is_some() {
+            bail!("step-up instruction URL must not contain a fragment");
+        }
+        let fragment = url::form_urlencoded::Serializer::new(String::new())
+            .append_pair("callback_secret", callback_secret)
+            .finish();
+        url.set_fragment(Some(&fragment));
+        return Ok(detail.replacen(candidate, url.as_str(), 1));
     }
-    let fragment = url::form_urlencoded::Serializer::new(String::new())
-        .append_pair("callback_secret", callback_secret)
-        .finish();
-    url.set_fragment(Some(&fragment));
-    Ok(url.into())
+
+    Ok(detail.to_owned())
 }
 
-fn validate_step_up_urls(
+fn validate_step_up_url(
     registry: &Registry<RegistryClient<'_>>,
     step_up: &StepUpRequired,
 ) -> CargoResult<()> {
     let registry_origin = registry.host().trim_end_matches('/');
-    if !crates_io::url_shares_origin_with_registry(&step_up.verification_url, registry.host()) {
-        bail!(
-            "refusing to open step-up verification URL `{}`; URL must use the same origin as the registry API ({})",
-            step_up.verification_url,
-            registry_origin
-        );
-    }
     if !crates_io::url_shares_origin_with_registry(&step_up.poll_url, registry.host()) {
         bail!(
             "refusing to poll step-up status at `{}`; URL must use the same origin as the registry API ({})",
@@ -224,7 +223,7 @@ fn wait_for_callback_or_poll(
     gctx: &GlobalContext,
     registry: &mut Registry<RegistryClient<'_>>,
     step_up: &StepUpRequired,
-    verification_url: &str,
+    detail: &str,
     listener: &OtpListener,
     timeout: Duration,
 ) -> CargoResult<Option<String>> {
@@ -238,10 +237,8 @@ fn wait_for_callback_or_poll(
         let elapsed = started.elapsed();
         if elapsed > timeout {
             bail!(
-                "timed out waiting for callback or step-up acknowledgment; \
-                 visit {} and retry{}",
-                verification_url,
-                timeout_hint(registry)
+                "timed out waiting for callback or step-up acknowledgment; {}",
+                detail
             );
         }
         let remaining = timeout.saturating_sub(elapsed);
@@ -273,7 +270,7 @@ fn wait_for_callback_or_poll(
                     gctx,
                     registry,
                     step_up,
-                    verification_url,
+                    detail,
                     timeout.saturating_sub(elapsed),
                 )?;
                 return Ok(None);
@@ -286,7 +283,7 @@ fn wait_for_poll_ack(
     gctx: &GlobalContext,
     registry: &mut Registry<RegistryClient<'_>>,
     step_up: &StepUpRequired,
-    verification_url: &str,
+    detail: &str,
     timeout: Duration,
 ) -> CargoResult<()> {
     let started = Instant::now();
@@ -300,10 +297,8 @@ fn wait_for_poll_ack(
         let elapsed = started.elapsed();
         if elapsed > timeout {
             bail!(
-                "timed out waiting for step-up acknowledgment; \
-                 visit {} and retry{}",
-                verification_url,
-                timeout_hint(registry)
+                "timed out waiting for step-up acknowledgment; {}",
+                detail
             );
         }
         let sleep_for = interval.min(timeout.saturating_sub(elapsed));
@@ -314,10 +309,8 @@ fn wait_for_poll_ack(
         let elapsed = started.elapsed();
         if elapsed > timeout {
             bail!(
-                "timed out waiting for step-up acknowledgment; \
-                 visit {} and retry{}",
-                verification_url,
-                timeout_hint(registry)
+                "timed out waiting for step-up acknowledgment; {}",
+                detail
             );
         }
         progress.tick_now(
@@ -366,9 +359,8 @@ fn poll_step_up_once(
             if code.as_u16() == 404 =>
         {
             bail!(
-                "step-up challenge expired or was not found; \
-                 visit {} and retry the original command",
-                step_up.verification_url
+                "step-up challenge expired or was not found; {}",
+                step_up.detail
             );
         }
         Err(err) => return Err(err.into()),
@@ -454,15 +446,6 @@ fn is_ci_env(gctx: &GlobalContext) -> bool {
     )
 }
 
-fn step_up_context_label(step_up: &StepUpRequired) -> String {
-    match (step_up.operation.as_deref(), step_up.crate_name.as_deref()) {
-        (Some(op), Some(krate)) => format!(" ({op} {krate})"),
-        (Some(op), None) => format!(" ({op})"),
-        (None, Some(krate)) => format!(" ({krate})"),
-        (None, None) => String::new(),
-    }
-}
-
 fn clamp_poll_interval(recommended_secs: Option<u64>) -> Duration {
     recommended_secs
         .map(Duration::from_secs)
@@ -483,14 +466,6 @@ fn timeout_from_expires_at(expires_at: Option<&str>) -> Duration {
         return Duration::from_secs(1);
     }
     Duration::from_secs(remaining.as_secs() as u64).min(DEFAULT_STEP_UP_TIMEOUT)
-}
-
-fn timeout_hint(registry: &Registry<RegistryClient<'_>>) -> &'static str {
-    if registry.host_is_crates_io() {
-        "; restart the exact command to create a fresh challenge"
-    } else {
-        ", or complete additional authentication with your registry"
-    }
 }
 
 /// Short-lived `127.0.0.1` HTTP listener that accepts a one-shot proof callback.
@@ -659,33 +634,40 @@ mod tests {
     use std::time::Instant;
 
     #[test]
-    fn callback_secret_is_added_only_to_displayed_verification_url() {
-        let url = verification_url_for_user(
-            "https://registry.example/verify/stp_test",
+    fn callback_secret_is_added_only_to_instruction_url() {
+        let detail = detail_for_user(
+            "Authenticate at https://registry.example/verify/stp_test.",
+            "https://registry.example",
             Some("callback_secret-_"),
         )
         .unwrap();
         assert_eq!(
-            url,
-            "https://registry.example/verify/stp_test#callback_secret=callback_secret-_"
+            detail,
+            "Authenticate at https://registry.example/verify/stp_test#callback_secret=callback_secret-_."
         );
         assert_eq!(
-            verification_url_for_user("https://registry.example/verify/stp_test", None).unwrap(),
-            "https://registry.example/verify/stp_test"
+            detail_for_user(
+                "Press the registered hardware button.",
+                "https://registry.example",
+                None,
+            )
+            .unwrap(),
+            "Press the registered hardware button."
         );
     }
 
     #[test]
     fn callback_secret_does_not_replace_a_registry_fragment() {
-        let error = verification_url_for_user(
-            "https://registry.example/verify/stp_test#registry-state",
+        let error = detail_for_user(
+            "Authenticate at https://registry.example/verify/stp_test#registry-state",
+            "https://registry.example",
             Some("callback_secret"),
         )
         .unwrap_err();
         assert!(
             error
                 .to_string()
-                .contains("verification URL must not contain a fragment")
+                .contains("instruction URL must not contain a fragment")
         );
     }
 
