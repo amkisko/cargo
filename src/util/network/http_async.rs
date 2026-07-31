@@ -143,6 +143,7 @@ impl Client {
         debug!(target: "network::fetch", url);
         let mut collector = Collector::new(self.stats.clone());
         let (parts, body) = request.into_parts();
+        collector.redact_debug_data = has_sensitive_step_up_headers(&parts.headers);
         let body_len = body.len();
         collector.request_body = Cursor::new(body);
         collector.debug = self.handle_config.verbose;
@@ -196,6 +197,11 @@ impl Client {
             .try_into()
             .unwrap()
     }
+}
+
+fn has_sensitive_step_up_headers(headers: &http::HeaderMap) -> bool {
+    headers.contains_key("cargo-step-up-callback-secret")
+        || headers.contains_key("cargo-step-up-proof")
 }
 
 impl Drop for Client {
@@ -443,6 +449,8 @@ struct Collector {
     request_body: Cursor<Vec<u8>>,
     /// Whether we're in debug mode
     debug: bool,
+    /// Whether this transfer carries step-up credentials that could be reflected.
+    redact_debug_data: bool,
     /// Global transfer statistics.
     global_stats: Arc<Stats>,
     /// How much has this particular transfer added to global `dl_remaining` stats.
@@ -455,6 +463,7 @@ impl Collector {
             response: Response::new(Vec::new()),
             request_body: Cursor::new(Vec::new()),
             debug: false,
+            redact_debug_data: false,
             global_stats: stats,
             dl_remaining_delta: 0,
         }
@@ -486,6 +495,14 @@ impl Handler for Collector {
 
     fn debug(&mut self, kind: InfoType, data: &[u8]) {
         if self.debug {
+            // A registry can reflect a request credential in any response header,
+            // body, or redirect, and curl may split it across debug chunks. Suppress
+            // the complete transfer trace instead of attempting substring redaction.
+            let data = if self.redact_debug_data {
+                b"[REDACTED]".as_slice()
+            } else {
+                data
+            };
             super::http::debug(kind, data);
         }
     }
@@ -569,4 +586,28 @@ fn handle_http_header(buf: &[u8]) -> Option<(&str, &str)> {
     let (tag, value) = buf.split_once(':')?;
     let value = value.trim();
     Some((tag, value))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::has_sensitive_step_up_headers;
+
+    #[test]
+    fn step_up_credentials_mark_http_trace_as_sensitive() {
+        let mut headers = http::HeaderMap::new();
+        assert!(!has_sensitive_step_up_headers(&headers));
+
+        headers.insert(
+            "Cargo-Step-Up-Callback-Secret",
+            http::HeaderValue::from_static("secret"),
+        );
+        assert!(has_sensitive_step_up_headers(&headers));
+
+        headers.remove("Cargo-Step-Up-Callback-Secret");
+        headers.insert(
+            "Cargo-Step-Up-Proof",
+            http::HeaderValue::from_static("proof"),
+        );
+        assert!(has_sensitive_step_up_headers(&headers));
+    }
 }

@@ -628,7 +628,7 @@ impl<T: HttpClient> Registry<T> {
 
     fn handle(&mut self, response: http::Response<Vec<u8>>) -> RegistryResult<String, T::Error> {
         let (head, body) = response.into_parts();
-        let body = String::from_utf8(body)?;
+        let body = redact_step_up_credentials(String::from_utf8(body)?, &self.step_up_headers);
         let api_errors = serde_json::from_str::<ApiErrorList>(&body).ok();
 
         let headers = head
@@ -636,6 +636,7 @@ impl<T: HttpClient> Registry<T> {
             .iter()
             .filter_map(|(k, v)| Some((k, v.to_str().ok()?)))
             .map(|(k, v)| format!("{k}: {v}"))
+            .map(|line| redact_step_up_credentials(line, &self.step_up_headers))
             .collect();
 
         // Only treat step-up challenges from error bodies. crates.io historically
@@ -664,6 +665,19 @@ impl<T: HttpClient> Registry<T> {
             }),
         }
     }
+}
+
+/// Removes client-held step-up credentials from a response before parsing,
+/// displaying, or including it in an error.
+fn redact_step_up_credentials(mut body: String, headers: &StepUpHeaders) -> String {
+    for credential in [headers.callback_secret.as_deref(), headers.proof.as_deref()]
+        .into_iter()
+        .flatten()
+        .filter(|credential| !credential.is_empty())
+    {
+        body = body.replace(credential, "[REDACTED]");
+    }
+    body
 }
 
 fn step_up_required_from_api_error(err: &ApiError) -> Option<StepUpRequired> {
@@ -751,7 +765,10 @@ pub fn check_token(token: &str) -> Result<(), TokenError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ApiError, step_up_required_from_api_error, url_shares_origin_with_registry};
+    use super::{
+        ApiError, StepUpHeaders, redact_step_up_credentials, step_up_required_from_api_error,
+        url_shares_origin_with_registry,
+    };
 
     #[test]
     fn step_up_poll_url_same_origin() {
@@ -825,5 +842,20 @@ mod tests {
             poll_url: Some("https://crates.io/api/v1/auth/challenges/stp_x".into()),
             ..ApiError::default()
         }
+    }
+
+    #[test]
+    fn step_up_credentials_are_redacted_from_registry_responses() {
+        let headers = StepUpHeaders {
+            callback_secret: Some("callback-secret".into()),
+            proof: Some("one-time-proof".into()),
+            ..StepUpHeaders::default()
+        };
+        let body = "callback-secret and one-time-proof".to_owned();
+
+        assert_eq!(
+            redact_step_up_credentials(body, &headers),
+            "[REDACTED] and [REDACTED]"
+        );
     }
 }
