@@ -454,6 +454,15 @@ fn is_ci_env(gctx: &GlobalContext) -> bool {
     )
 }
 
+fn step_up_context_label(step_up: &StepUpRequired) -> String {
+    match (step_up.operation.as_deref(), step_up.crate_name.as_deref()) {
+        (Some(op), Some(krate)) => format!(" ({op} {krate})"),
+        (Some(op), None) => format!(" ({op})"),
+        (None, Some(krate)) => format!(" ({krate})"),
+        (None, None) => String::new(),
+    }
+}
+
 fn clamp_poll_interval(recommended_secs: Option<u64>) -> Duration {
     recommended_secs
         .map(Duration::from_secs)
@@ -474,6 +483,14 @@ fn timeout_from_expires_at(expires_at: Option<&str>) -> Duration {
         return Duration::from_secs(1);
     }
     Duration::from_secs(remaining.as_secs() as u64).min(DEFAULT_STEP_UP_TIMEOUT)
+}
+
+fn timeout_hint(registry: &Registry<RegistryClient<'_>>) -> &'static str {
+    if registry.host_is_crates_io() {
+        "; restart the exact command to create a fresh challenge"
+    } else {
+        ", or complete additional authentication with your registry"
+    }
 }
 
 /// Short-lived `127.0.0.1` HTTP listener that accepts a one-shot proof callback.
@@ -640,6 +657,37 @@ fn write_otp_success_response(mut stream: &TcpStream) -> std::io::Result<()> {
 mod tests {
     use super::*;
     use std::time::Instant;
+
+    #[test]
+    fn callback_secret_is_added_only_to_displayed_verification_url() {
+        let url = verification_url_for_user(
+            "https://registry.example/verify/stp_test",
+            Some("callback_secret-_"),
+        )
+        .unwrap();
+        assert_eq!(
+            url,
+            "https://registry.example/verify/stp_test#callback_secret=callback_secret-_"
+        );
+        assert_eq!(
+            verification_url_for_user("https://registry.example/verify/stp_test", None).unwrap(),
+            "https://registry.example/verify/stp_test"
+        );
+    }
+
+    #[test]
+    fn callback_secret_does_not_replace_a_registry_fragment() {
+        let error = verification_url_for_user(
+            "https://registry.example/verify/stp_test#registry-state",
+            Some("callback_secret"),
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("verification URL must not contain a fragment")
+        );
+    }
 
     #[test]
     fn localhost_listener_accepts_valid_proof() {
