@@ -93,19 +93,25 @@ where
                 Ok(value) => return Ok(value),
                 Err(RegistryError::StepUpRequired(step_up)) => {
                     validate_step_up_urls(registry, &step_up)?;
+                    let verification_url = verification_url_for_user(
+                        &step_up.verification_url,
+                        listener
+                            .as_ref()
+                            .map(|listener| listener.callback_secret.as_str()),
+                    )?;
                     handshakes += 1;
                     if handshakes > MAX_STEP_UP_HANDSHAKES {
                         bail!(
                             "exceeded {MAX_STEP_UP_HANDSHAKES} step-up handshake attempts; \
                              visit {} and retry, or complete additional authentication with your registry",
-                            step_up.verification_url
+                            verification_url
                         );
                     }
                     if channel == StepUpChannel::Disabled {
                         bail!(
                             "additional authentication is required but step-up interaction is \\
                              disabled by {CHANNEL_ENV}; visit {} and retry from an interactive session{}",
-                            step_up.verification_url,
+                            verification_url,
                             timeout_hint(registry)
                         );
                     }
@@ -114,11 +120,17 @@ where
                             "additional authentication is required but Cargo is running \
                              non-interactively; visit {} from an interactive session, \
                              use Trusted Publishing{}",
-                            step_up.verification_url,
+                            verification_url,
                             timeout_hint(registry)
                         );
                     }
-                    proof = wait_for_step_up(gctx, registry, &step_up, listener.as_ref())?;
+                    proof = wait_for_step_up(
+                        gctx,
+                        registry,
+                        &step_up,
+                        &verification_url,
+                        listener.as_ref(),
+                    )?;
                 }
                 Err(err) => return Err(err.into()),
             }
@@ -136,6 +148,7 @@ fn wait_for_step_up(
     gctx: &GlobalContext,
     registry: &mut Registry<RegistryClient<'_>>,
     step_up: &StepUpRequired,
+    verification_url: &str,
     listener: Option<&OtpListener>,
 ) -> CargoResult<Option<String>> {
     gctx.shell().note(
@@ -145,16 +158,44 @@ fn wait_for_step_up(
     let context = step_up_context_label(step_up);
     gctx.shell().status(
         "Verifying",
-        format!("please visit {}{context}", step_up.verification_url),
+        format!("please visit {verification_url}{context}"),
     )?;
 
     let timeout = timeout_from_expires_at(step_up.expires_at.as_deref());
     if let Some(listener) = listener {
-        return wait_for_callback_or_poll(gctx, registry, step_up, listener, timeout);
+        return wait_for_callback_or_poll(
+            gctx,
+            registry,
+            step_up,
+            verification_url,
+            listener,
+            timeout,
+        );
     }
 
-    wait_for_poll_ack(gctx, registry, step_up, timeout)?;
+    wait_for_poll_ack(gctx, registry, step_up, verification_url, timeout)?;
     Ok(None)
+}
+
+/// Adds client-held callback state to the browser URL without sending it back
+/// through the registry response body.
+fn verification_url_for_user(
+    verification_url: &str,
+    callback_secret: Option<&str>,
+) -> CargoResult<String> {
+    let Some(callback_secret) = callback_secret else {
+        return Ok(verification_url.to_owned());
+    };
+
+    let mut url = Url::parse(verification_url)?;
+    if url.fragment().is_some() {
+        bail!("step-up verification URL must not contain a fragment");
+    }
+    let fragment = url::form_urlencoded::Serializer::new(String::new())
+        .append_pair("callback_secret", callback_secret)
+        .finish();
+    url.set_fragment(Some(&fragment));
+    Ok(url.into())
 }
 
 fn validate_step_up_urls(
@@ -183,6 +224,7 @@ fn wait_for_callback_or_poll(
     gctx: &GlobalContext,
     registry: &mut Registry<RegistryClient<'_>>,
     step_up: &StepUpRequired,
+    verification_url: &str,
     listener: &OtpListener,
     timeout: Duration,
 ) -> CargoResult<Option<String>> {
@@ -198,7 +240,7 @@ fn wait_for_callback_or_poll(
             bail!(
                 "timed out waiting for callback or step-up acknowledgment; \
                  visit {} and retry{}",
-                step_up.verification_url,
+                verification_url,
                 timeout_hint(registry)
             );
         }
@@ -227,7 +269,13 @@ fn wait_for_callback_or_poll(
                 )?;
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
-                wait_for_poll_ack(gctx, registry, step_up, timeout.saturating_sub(elapsed))?;
+                wait_for_poll_ack(
+                    gctx,
+                    registry,
+                    step_up,
+                    verification_url,
+                    timeout.saturating_sub(elapsed),
+                )?;
                 return Ok(None);
             }
         }
@@ -238,6 +286,7 @@ fn wait_for_poll_ack(
     gctx: &GlobalContext,
     registry: &mut Registry<RegistryClient<'_>>,
     step_up: &StepUpRequired,
+    verification_url: &str,
     timeout: Duration,
 ) -> CargoResult<()> {
     let started = Instant::now();
@@ -253,7 +302,7 @@ fn wait_for_poll_ack(
             bail!(
                 "timed out waiting for step-up acknowledgment; \
                  visit {} and retry{}",
-                step_up.verification_url,
+                verification_url,
                 timeout_hint(registry)
             );
         }
@@ -267,7 +316,7 @@ fn wait_for_poll_ack(
             bail!(
                 "timed out waiting for step-up acknowledgment; \
                  visit {} and retry{}",
-                step_up.verification_url,
+                verification_url,
                 timeout_hint(registry)
             );
         }
@@ -405,15 +454,6 @@ fn is_ci_env(gctx: &GlobalContext) -> bool {
     )
 }
 
-fn step_up_context_label(step_up: &StepUpRequired) -> String {
-    match (step_up.operation.as_deref(), step_up.crate_name.as_deref()) {
-        (Some(op), Some(krate)) => format!(" ({op} {krate})"),
-        (Some(op), None) => format!(" ({op})"),
-        (None, Some(krate)) => format!(" ({krate})"),
-        (None, None) => String::new(),
-    }
-}
-
 fn clamp_poll_interval(recommended_secs: Option<u64>) -> Duration {
     recommended_secs
         .map(Duration::from_secs)
@@ -434,14 +474,6 @@ fn timeout_from_expires_at(expires_at: Option<&str>) -> Duration {
         return Duration::from_secs(1);
     }
     Duration::from_secs(remaining.as_secs() as u64).min(DEFAULT_STEP_UP_TIMEOUT)
-}
-
-fn timeout_hint(registry: &Registry<RegistryClient<'_>>) -> &'static str {
-    if registry.host_is_crates_io() {
-        "; restart the exact command to create a fresh challenge"
-    } else {
-        ", or complete additional authentication with your registry"
-    }
 }
 
 /// Short-lived `127.0.0.1` HTTP listener that accepts a one-shot proof callback.

@@ -4939,7 +4939,7 @@ fn step_up_callback_falls_back_to_poll_then_retry() {
                 );
                 let origin = req.url.origin().ascii_serialization();
                 let body = format!(
-                    r#"{{"errors":[{{"detail":"Additional authentication is required","id":"step_up_required","protocol_version":1,"interaction":"browser","challenge_id":"stp_testop","operation":"publish","crate":"foo","verification_url":"{origin}/verify/stp_testop","poll_url":"{origin}/api/v1/auth/challenges/stp_testop","expires_at":"2099-01-01T00:00:00Z","recommended_poll_interval_secs":1}}]}}"#
+                    r#"{{"errors":[{{"detail":"Additional authentication is required. Visit {origin}/verify/stp_testop.","id":"step_up_required","protocol_version":1,"challenge_id":"stp_testop","operation":"publish","crate":"foo","poll_url":"{origin}/api/v1/auth/challenges/stp_testop","expires_at":"2099-01-01T00:00:00Z","recommended_poll_interval_secs":1}}]}}"#
                 );
                 Response {
                     // crates.io compatibility middleware rewrites this error to 200.
@@ -4997,8 +4997,7 @@ fn step_up_callback_falls_back_to_poll_then_retry() {
 [PACKAGING] foo v0.0.1 ([..]foo)
 [PACKAGED] 4 files, [FILE_SIZE]B ([FILE_SIZE]B compressed)
 [UPLOADING] foo v0.0.1 ([..]foo)
-[NOTE] additional authentication is required; complete verification in your browser, then Cargo will retry
-[VERIFYING] please visit http://127.0.0.1:[..]/verify/stp_testop (publish foo)
+[NOTE] Additional authentication is required. Visit http://127.0.0.1:[..]/verify/stp_testop.
 [NOTE] step-up acknowledged; retrying request
 [UPLOADED] foo v0.0.1 to registry `alternative`
 [NOTE] waiting for foo v0.0.1 to be available at registry `alternative`
@@ -5026,7 +5025,7 @@ fn step_up_rejects_poll_redirect() {
         .add_responder("/api/v1/crates/new", |req, _server| {
             let origin = req.url.origin().ascii_serialization();
             let body = format!(
-                r#"{{"errors":[{{"detail":"Additional authentication is required","id":"step_up_required","protocol_version":1,"interaction":"browser","challenge_id":"stp_redir","operation":"publish","crate":"foo","verification_url":"{origin}/verify/stp_redir","poll_url":"{origin}/api/v1/auth/challenges/stp_redir","expires_at":"2099-01-01T00:00:00Z","recommended_poll_interval_secs":1}}]}}"#
+                r#"{{"errors":[{{"detail":"Additional authentication is required. Visit {origin}/verify/stp_redir.","id":"step_up_required","protocol_version":1,"challenge_id":"stp_redir","operation":"publish","crate":"foo","poll_url":"{origin}/api/v1/auth/challenges/stp_redir","expires_at":"2099-01-01T00:00:00Z","recommended_poll_interval_secs":1}}]}}"#
             );
             Response {
                 code: 403,
@@ -5071,8 +5070,7 @@ fn step_up_rejects_poll_redirect() {
 [PACKAGING] foo v0.0.1 ([..]foo)
 [PACKAGED] 4 files, [FILE_SIZE]B ([FILE_SIZE]B compressed)
 [UPLOADING] foo v0.0.1 ([..]foo)
-[NOTE] additional authentication is required; complete verification in your browser, then Cargo will retry
-[VERIFYING] please visit http://127.0.0.1:[..]/verify/stp_redir (publish foo)
+[NOTE] Additional authentication is required. Visit http://127.0.0.1:[..]/verify/stp_redir.
 [ERROR] failed to publish foo v0.0.1 to registry at http://127.0.0.1:[..]/
 
 Caused by:
@@ -5091,7 +5089,7 @@ fn step_up_rejects_cross_origin_poll_url() {
         .add_responder("/api/v1/crates/new", |req, _server| {
             let origin = req.url.origin().ascii_serialization();
             let body = format!(
-                r#"{{"errors":[{{"detail":"Additional authentication is required","id":"step_up_required","protocol_version":1,"interaction":"browser","challenge_id":"stp_evil","operation":"publish","crate":"foo","verification_url":"{origin}/verify/stp_evil","poll_url":"http://127.0.0.1:9/evil","expires_at":"2099-01-01T00:00:00Z","recommended_poll_interval_secs":1}}]}}"#
+                r#"{{"errors":[{{"detail":"Additional authentication is required. Visit {origin}/verify/stp_evil.","id":"step_up_required","protocol_version":1,"challenge_id":"stp_evil","operation":"publish","crate":"foo","poll_url":"http://127.0.0.1:9/evil","expires_at":"2099-01-01T00:00:00Z","recommended_poll_interval_secs":1}}]}}"#
             );
             Response {
                 code: 403,
@@ -5146,7 +5144,7 @@ fn step_up_poll_not_found() {
         .add_responder("/api/v1/crates/new", |req, _server| {
             let origin = req.url.origin().ascii_serialization();
             let body = format!(
-                r#"{{"errors":[{{"detail":"Additional authentication is required","id":"step_up_required","protocol_version":1,"interaction":"browser","challenge_id":"stp_gone","operation":"publish","crate":"foo","verification_url":"{origin}/verify/stp_gone","poll_url":"{origin}/api/v1/auth/challenges/stp_gone","expires_at":"2099-01-01T00:00:00Z","recommended_poll_interval_secs":1}}]}}"#
+                r#"{{"errors":[{{"detail":"Additional authentication is required. Visit {origin}/verify/stp_gone and retry the original command.","id":"step_up_required","protocol_version":1,"challenge_id":"stp_gone","operation":"publish","crate":"foo","poll_url":"{origin}/api/v1/auth/challenges/stp_gone","expires_at":"2099-01-01T00:00:00Z","recommended_poll_interval_secs":1}}]}}"#
             );
             Response {
                 code: 403,
@@ -5188,12 +5186,11 @@ fn step_up_poll_not_found() {
 [PACKAGING] foo v0.0.1 ([..]foo)
 [PACKAGED] 4 files, [FILE_SIZE]B ([FILE_SIZE]B compressed)
 [UPLOADING] foo v0.0.1 ([..]foo)
-[NOTE] additional authentication is required; complete verification in your browser, then Cargo will retry
-[VERIFYING] please visit http://127.0.0.1:[..]/verify/stp_gone (publish foo)
+[NOTE] Additional authentication is required. Visit http://127.0.0.1:[..]/verify/stp_gone and retry the original command.
 [ERROR] failed to publish foo v0.0.1 to registry at http://127.0.0.1:[..]/
 
 Caused by:
-  step-up challenge expired or was not found; visit http://127.0.0.1:[..]/verify/stp_gone and retry the original command
+  step-up challenge expired or was not found; Additional authentication is required. Visit http://127.0.0.1:[..]/verify/stp_gone and retry the original command.
 
 "#]])
         .run();
@@ -5242,7 +5239,7 @@ fn step_up_localhost_otp_then_retry() {
                 });
                 let origin = req.url.origin().ascii_serialization();
                 let body = format!(
-                    r#"{{"errors":[{{"detail":"Additional authentication is required","id":"step_up_required","protocol_version":1,"interaction":"browser","challenge_id":"stp_otp","operation":"publish","crate":"foo","verification_url":"{origin}/verify/stp_otp","poll_url":"{origin}/api/v1/auth/challenges/stp_otp","expires_at":"2099-01-01T00:00:00Z","recommended_poll_interval_secs":1}}]}}"#
+                    r#"{{"errors":[{{"detail":"Additional authentication is required. Visit {origin}/verify/stp_otp.","id":"step_up_required","protocol_version":1,"challenge_id":"stp_otp","operation":"publish","crate":"foo","poll_url":"{origin}/api/v1/auth/challenges/stp_otp","expires_at":"2099-01-01T00:00:00Z","recommended_poll_interval_secs":1}}]}}"#
                 );
                 Response {
                     code: 403,
@@ -5292,8 +5289,7 @@ fn step_up_localhost_otp_then_retry() {
 [PACKAGING] foo v0.0.1 ([..]foo)
 [PACKAGED] 4 files, [FILE_SIZE]B ([FILE_SIZE]B compressed)
 [UPLOADING] foo v0.0.1 ([..]foo)
-[NOTE] additional authentication is required; complete verification in your browser, then Cargo will retry
-[VERIFYING] please visit http://127.0.0.1:[..]/verify/stp_otp (publish foo)
+[NOTE] Additional authentication is required. Visit http://127.0.0.1:[..]/verify/stp_otp.
 [NOTE] step-up proof received; retrying request
 [UPLOADED] foo v0.0.1 to registry `alternative`
 [NOTE] waiting for foo v0.0.1 to be available at registry `alternative`
@@ -5330,7 +5326,7 @@ fn step_up_fail_fast_when_noninteractive() {
         .add_responder("/api/v1/crates/new", |req, _server| {
             let origin = req.url.origin().ascii_serialization();
             let body = format!(
-                r#"{{"errors":[{{"detail":"Additional authentication is required","id":"step_up_required","protocol_version":1,"interaction":"browser","challenge_id":"stp_ci","operation":"publish","crate":"foo","verification_url":"{origin}/verify/stp_ci","poll_url":"{origin}/api/v1/auth/challenges/stp_ci","expires_at":"2099-01-01T00:00:00Z","recommended_poll_interval_secs":1}}]}}"#
+                r#"{{"errors":[{{"detail":"Additional authentication is required. Visit {origin}/verify/stp_ci from an interactive session.","id":"step_up_required","protocol_version":1,"challenge_id":"stp_ci","operation":"publish","crate":"foo","poll_url":"{origin}/api/v1/auth/challenges/stp_ci","expires_at":"2099-01-01T00:00:00Z","recommended_poll_interval_secs":1}}]}}"#
             );
             Response {
                 code: 403,
@@ -5371,7 +5367,7 @@ fn step_up_fail_fast_when_noninteractive() {
 [ERROR] failed to publish foo v0.0.1 to registry at http://127.0.0.1:[..]/
 
 Caused by:
-  additional authentication is required but Cargo is running non-interactively; visit http://127.0.0.1:[..]/verify/stp_ci from an interactive session, use Trusted Publishing, or complete additional authentication with your registry
+  additional authentication is required but Cargo is running non-interactively; Additional authentication is required. Visit http://127.0.0.1:[..]/verify/stp_ci from an interactive session.
 
 "#]])
         .run();
