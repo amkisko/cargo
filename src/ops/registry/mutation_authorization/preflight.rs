@@ -3,7 +3,7 @@
 use std::io::IsTerminal;
 use std::time::Duration;
 
-use anyhow::bail;
+use anyhow::{Context, bail};
 use crates_io::{MutationAuthorizationResponse, Registry};
 use rand::distr::{Alphanumeric, SampleString};
 use url::Url;
@@ -15,8 +15,6 @@ use super::callback::CallbackListener;
 
 pub(super) const IDEMPOTENT_FINAL: &str = "idempotent-final";
 pub(super) const LOOPBACK_CALLBACK: &str = "loopback-callback";
-const PREFER_LOOPBACK_ENV: &str = "CARGO_REGISTRY_MUTATION_AUTHORIZATION_PREFER_LOOPBACK";
-const INTERACTIVE_ENV: &str = "CARGO_REGISTRY_MUTATION_AUTHORIZATION_INTERACTIVE";
 const CHANNEL_ENV: &str = "CARGO_REGISTRY_MUTATION_AUTHORIZATION_CHANNEL";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -77,24 +75,27 @@ pub(super) fn authorization_channel(
 pub(super) fn maybe_start_callback_listener(
     gctx: &GlobalContext,
     channel: AuthorizationChannel,
-) -> Option<CallbackListener> {
+) -> CargoResult<Option<CallbackListener>> {
     let use_loopback = match channel {
         AuthorizationChannel::Auto => prefer_loopback_callback(gctx),
         AuthorizationChannel::Loopback => true,
         AuthorizationChannel::Poll | AuthorizationChannel::Disabled => false,
     };
     if !use_loopback {
-        return None;
+        return Ok(None);
     }
     match CallbackListener::bind() {
-        Ok(listener) => Some(listener),
+        Ok(listener) => Ok(Some(listener)),
+        Err(err) if channel == AuthorizationChannel::Loopback => Err(err).context(
+            "failed to bind the loopback listener requested by `--registry-authorization=loopback`",
+        ),
         Err(err) => {
             let _ = gctx.shell().verbose(|shell| {
                 shell.note(format!(
                     "could not bind mutation-authorization loopback listener ({err}); using poll fallback"
                 ))
             });
-            None
+            Ok(None)
         }
     }
 }
@@ -109,18 +110,11 @@ pub(super) fn is_noninteractive_authorization(
     ) {
         return false;
     }
-    if env_flag_set(gctx, INTERACTIVE_ENV) || env_flag_set(gctx, PREFER_LOOPBACK_ENV) {
-        return false;
-    }
     is_ci_env(gctx) || !std::io::stdin().is_terminal()
 }
 
 fn prefer_loopback_callback(gctx: &GlobalContext) -> bool {
-    env_flag_set(gctx, PREFER_LOOPBACK_ENV) || (std::io::stdin().is_terminal() && !is_ci_env(gctx))
-}
-
-fn env_flag_set(gctx: &GlobalContext, name: &str) -> bool {
-    gctx.get_env_os(name).is_some()
+    std::io::stdin().is_terminal() && !is_ci_env(gctx)
 }
 
 fn is_ci_env(gctx: &GlobalContext) -> bool {

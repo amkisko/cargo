@@ -78,7 +78,7 @@ where
     F: FnMut(&mut Registry<RegistryClient<'_>>) -> Result<T, RegistryError<http_async::Error>>,
     R: FnMut() -> CargoResult<String>,
 {
-    let mut listener = maybe_start_callback_listener(gctx, channel);
+    let mut listener = maybe_start_callback_listener(gctx, channel)?;
     let callback = listener.as_ref().map(|listener| MutationCallback {
         url: listener.url(),
     });
@@ -175,6 +175,13 @@ where
                 http_status.as_u16()
             ),
         };
+
+        // The callback is only a wake-up signal. Once polling has established
+        // readiness, stop accepting loopback traffic before sending the final
+        // mutation and its ordinary registry credential.
+        if let Some(listener) = listener.take() {
+            listener.shutdown();
+        }
 
         registry.set_token(Some(refresh_credential()?));
         registry.set_mutation_headers(MutationHeaders {
