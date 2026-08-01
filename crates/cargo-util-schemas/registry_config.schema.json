@@ -21,7 +21,7 @@
       "default": false
     },
     "mutation-authorization": {
-      "description": "Supported versions and operations for registry mutation authorization.\n\nRegistries advertise an operation only after both mutation preflight and\nidempotent final requests implement the selected protocol version.",
+      "description": "Registry mutation-authorization protocol capability.\n\nRegistries advertise after implementing the core mutation endpoints;\ncompanion guarantees are listed independently in `extensions`.",
       "anyOf": [
         {
           "$ref": "#/$defs/MutationAuthorization"
@@ -40,17 +40,14 @@
       "description": "Registry mutation-authorization capabilities advertised by `config.json`.",
       "type": "object",
       "properties": {
-        "versions": {
-          "description": "Protocol versions supported by the registry.",
-          "type": "array",
-          "items": {
-            "type": "integer",
-            "format": "uint64",
-            "minimum": 0
-          }
+        "version": {
+          "description": "Latest protocol version implemented by the registry.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
         },
-        "operations": {
-          "description": "Ordinary registry mutations protected by the protocol.",
+        "extensions": {
+          "description": "Independently specified protocol extensions implemented by the registry.",
           "type": "array",
           "items": {
             "type": "string"
@@ -58,8 +55,7 @@
         }
       },
       "required": [
-        "versions",
-        "operations"
+        "version"
       ]
     }
   }

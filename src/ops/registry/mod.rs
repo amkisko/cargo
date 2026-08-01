@@ -166,19 +166,12 @@ fn registry<'gctx>(
     let handle = RegistryClient(gctx.http_async()?);
     let mut registry = Registry::new_handle(api_host, token, handle, cfg.auth_required);
     if let Some(capabilities) = cfg.mutation_authorization {
-        let distinct_versions: std::collections::HashSet<_> =
-            capabilities.versions.iter().copied().collect();
-        let distinct_operations: std::collections::HashSet<_> =
-            capabilities.operations.iter().collect();
-        if capabilities.versions.is_empty()
-            || capabilities.versions.contains(&0)
-            || distinct_versions.len() != capabilities.versions.len()
-            || capabilities.operations.is_empty()
-            || distinct_operations.len() != capabilities.operations.len()
-        {
+        let distinct_extensions: std::collections::HashSet<_> =
+            capabilities.extensions.iter().collect();
+        if capabilities.version == 0 || distinct_extensions.len() != capabilities.extensions.len() {
             bail!("registry has an invalid `mutation-authorization` capability envelope");
         }
-        registry.set_mutation_authorization(capabilities.versions, capabilities.operations);
+        registry.set_mutation_authorization(capabilities.version, capabilities.extensions);
     }
     Ok((registry, src))
 }

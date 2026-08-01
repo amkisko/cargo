@@ -35,24 +35,25 @@ detailed or user-centric error message.
 ### Mutation authorization
 
 A registry can require additional authorization for publish, yank, unyank, and
-owner changes. It advertises supported versions and operations in index
-`config.json`:
+owner changes. It advertises its implementation capability in index
+`config.json`; per-user and per-credential policy is evaluated by preflight:
 
 ```json
 {
     "mutation-authorization": {
-        "versions": [1],
-        "operations": ["publish", "yank", "unyank", "owners"]
+        "version": 1,
+        "extensions": ["idempotent-final", "loopback-callback"]
     }
 }
 ```
 
-For an advertised operation, Cargo first sends an authenticated `POST` to
+For a version 1 mutation, Cargo first sends an authenticated `POST` to
 `/api/v1/auth/mutation-challenges`. The JSON body contains protocol version 1,
 a fresh `preflight_id`, `allow_pending`, and an exact mutation descriptor. The
-descriptor binds the method, request target, normalized content type, raw body
-SHA-256 and size, and the operation-specific crate, version, owner, and archive
-facts. A callback-capable client can also register the exact loopback URL
+core descriptor binds the raw body SHA-256 and size and the operation-specific
+crate, version, owner, and archive facts. `idempotent-final` additionally binds
+the method, request target, and normalized content type. A callback-capable
+client can also register the exact loopback URL
 `http://127.0.0.1:{port}/cargo/registry-authorization`.
 
 A `200 OK` response with `status: "ready"` provides a `mutation_id` and
@@ -63,16 +64,18 @@ authorization would require waiting, the registry returns
 `interaction_required` with `403 Forbidden` and creates no record.
 
 Cargo polls without its primary credential. Poll status is `pending`, `ready`,
-`denied`, or `expired`. A loopback callback carries only client-generated
-`state` and causes an immediate poll; it is never proof of authorization.
-Cargo adds the state to the structured same-origin `verification_url` as a URL
-fragment, so it is not sent to the registry.
+`denied`, or `expired`. When `loopback-callback` is advertised, a loopback
+callback carries only client-generated `state` and causes an immediate poll;
+it is never proof of authorization. Cargo adds the state to the structured
+same-origin `verification_url` as a URL fragment, so it is not sent to the
+registry.
 
 After `ready`, Cargo obtains an ordinary primary credential and sends the
-original mutation with `Cargo-Mutation-Id`. The registry checks the credential
-binding and exact descriptor, executes the mutation at most once, and retains
-and replays its terminal response. Preflight never stages an upload or reserves
-a version.
+original mutation with `Cargo-Mutation-Id`. The registry checks its credential
+binding and exact descriptor. When `idempotent-final` is advertised, Cargo may
+retry ambiguous or transient final requests; the registry executes the logical
+mutation at most once and replays its retained terminal response. Preflight
+never stages an upload or reserves a version.
 
 `CARGO_REGISTRY_MUTATION_AUTHORIZATION_CHANNEL` selects `auto`, `loopback`,
 `poll`, or `disabled`. In non-interactive `auto` mode Cargo still preflights

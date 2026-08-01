@@ -38,9 +38,10 @@ The keys are:
 - `auth-required`: indicates whether this is a private registry that requires
   all operations to be authenticated including API requests, crate downloads
   and sparse index updates.
-- `mutation-authorization`: advertises supported protocol `versions` and
-  protected `operations`. A registry should list an operation only after its
-  preflight and idempotent final endpoint implement that version.
+- `mutation-authorization`: advertises the latest implemented protocol
+  `version` and optional independently specified `extensions`. This is an
+  implementation capability; the authenticated preflight decides whether the
+  exact operation and credential require interaction.
 
 [mutation authorization]: registry-web-api.md#mutation-authorization
 

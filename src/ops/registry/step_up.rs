@@ -20,6 +20,7 @@ use crates_io::MutationCallback;
 use crates_io::MutationDescriptor;
 use crates_io::MutationHeaders;
 use crates_io::Registry;
+use rand::RngExt;
 use rand::distr::{Alphanumeric, SampleString};
 use url::Url;
 
@@ -52,6 +53,8 @@ const PREFER_LOCALHOST_ENV: &str = "CARGO_STEP_UP_PREFER_LOCALHOST";
 const INTERACTIVE_ENV: &str = "CARGO_STEP_UP_INTERACTIVE";
 /// Selects `auto`, `loopback`, `poll`, or `disabled` completion behavior.
 const CHANNEL_ENV: &str = "CARGO_REGISTRY_MUTATION_AUTHORIZATION_CHANNEL";
+const IDEMPOTENT_FINAL_EXTENSION: &str = "idempotent-final";
+const LOOPBACK_CALLBACK_EXTENSION: &str = "loopback-callback";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum AuthorizationChannel {
@@ -77,13 +80,10 @@ where
     if channel == AuthorizationChannel::Disabled {
         return op(registry).map_err(Into::into);
     }
-    if registry.mutation_authorization_version_unsupported(descriptor.operation()) {
-        bail!(
-            "registry advertises mutation authorization for `{}` but has no version supported by this Cargo",
-            descriptor.operation()
-        );
+    if registry.mutation_authorization_version_unsupported() {
+        bail!("registry advertises a mutation authorization version unsupported by this Cargo");
     }
-    if !registry.supports_mutation_authorization(descriptor.operation()) {
+    if !registry.supports_mutation_authorization() {
         return op(registry).map_err(Into::into);
     }
 
@@ -102,7 +102,14 @@ fn with_preflight<T, F>(
 where
     F: FnMut(&mut Registry<RegistryClient<'_>>) -> Result<T, RegistryError<http_async::Error>>,
 {
-    let mut listener = maybe_start_callback_listener(gctx, channel);
+    let loopback_supported =
+        registry.supports_mutation_authorization_extension(LOOPBACK_CALLBACK_EXTENSION);
+    if channel == AuthorizationChannel::Loopback && !loopback_supported {
+        bail!("registry does not advertise the `loopback-callback` authorization extension");
+    }
+    let idempotent_final =
+        registry.supports_mutation_authorization_extension(IDEMPOTENT_FINAL_EXTENSION);
+    let mut listener = maybe_start_callback_listener(gctx, channel, loopback_supported);
     let callback = listener.as_ref().map(|listener| MutationCallback {
         url: format!(
             "http://127.0.0.1:{}/cargo/registry-authorization",
@@ -124,15 +131,18 @@ where
                 .preflight_mutation(&descriptor, &preflight_id, allow_pending, callback.as_ref())?,
             result => result?,
         };
-        let mutation_id = match response.status.as_str() {
+        let (mutation_id, grant_lifetime) = match response.status.as_str() {
             "ready" if http_status == http::StatusCode::OK => {
                 validate_protocol_version(&response)?;
-                validate_lifetime("grant_expires_in", response.grant_expires_in)?;
+                let grant_lifetime = Duration::from_secs(validate_lifetime(
+                    "grant_expires_in",
+                    response.grant_expires_in,
+                )?);
                 let mutation_id = response
                     .mutation_id
                     .ok_or_else(|| anyhow::format_err!("ready preflight omitted mutation_id"))?;
                 validate_protocol_id("mutation_id", &mutation_id)?;
-                mutation_id
+                (mutation_id, grant_lifetime)
             }
             "pending" if http_status == http::StatusCode::ACCEPTED && allow_pending => {
                 let pending = validate_pending(registry, response)?;
@@ -144,8 +154,9 @@ where
                         .as_ref()
                         .map(|listener| listener.callback_state.as_str()),
                 )?;
-                wait_for_authorization(gctx, registry, &pending, &detail, listener.as_ref())?;
-                pending.mutation_id
+                let grant_lifetime =
+                    wait_for_authorization(gctx, registry, &pending, &detail, listener.as_ref())?;
+                (pending.mutation_id, grant_lifetime)
             }
             "interaction_required" if http_status == http::StatusCode::FORBIDDEN => {
                 validate_interaction_required(&response)?;
@@ -172,24 +183,22 @@ where
             mutation_id: Some(mutation_id),
         });
 
+        if !idempotent_final {
+            return op(registry).map_err(Into::into);
+        }
+
         // A single bounded retry covers an interrupted or response-ambiguous
-        // transport. The registry serializes and replays this mutation ID.
+        // transport when the registry promises terminal replay.
+        let retry_deadline = Instant::now() + grant_lifetime;
         match op(registry) {
-            Err(RegistryError::Transport(_) | RegistryError::Timeout(_)) => {
-                op(registry).map_err(Into::into)
-            }
-            Err(RegistryError::Code { code, .. } | RegistryError::Api { code, .. })
-                if matches!(
-                    code,
-                    http::StatusCode::REQUEST_TIMEOUT
-                        | http::StatusCode::TOO_EARLY
-                        | http::StatusCode::TOO_MANY_REQUESTS
-                        | http::StatusCode::INTERNAL_SERVER_ERROR
-                        | http::StatusCode::BAD_GATEWAY
-                        | http::StatusCode::SERVICE_UNAVAILABLE
-                        | http::StatusCode::GATEWAY_TIMEOUT
-                ) =>
-            {
+            Err(error) if final_request_is_retryable(&error) => {
+                let retry_after = final_request_retry_after(&error);
+                let Some(delay) = bounded_retry_delay(retry_after, retry_deadline) else {
+                    return Err(error.into());
+                };
+                if !delay.is_zero() {
+                    std::thread::sleep(delay);
+                }
                 op(registry).map_err(Into::into)
             }
             result => result.map_err(Into::into),
@@ -294,7 +303,7 @@ fn wait_for_authorization(
     pending: &PendingAuthorization,
     detail: &str,
     listener: Option<&CallbackListener>,
-) -> CargoResult<()> {
+) -> CargoResult<Duration> {
     essential_note(gctx, detail)?;
     essential_note(
         gctx,
@@ -442,7 +451,7 @@ fn wait_for_callback_or_poll(
     detail: &str,
     listener: &CallbackListener,
     timeout: Duration,
-) -> CargoResult<()> {
+) -> CargoResult<Duration> {
     let started = Instant::now();
     let mut deadline = started + timeout;
     let mut interval = clamp_poll_interval(pending.recommended_poll_interval_secs);
@@ -457,10 +466,10 @@ fn wait_for_callback_or_poll(
         let remaining = deadline.saturating_duration_since(Instant::now());
         match listener.receiver.recv_timeout(remaining.min(interval)) {
             Ok(()) => match poll_authorization_once(registry, pending)? {
-                PollResult::Ready => {
+                PollResult::Ready { grant_lifetime } => {
                     gctx.shell()
                         .note("registry authorization ready; continuing")?;
-                    return Ok(());
+                    return Ok(grant_lifetime);
                 }
                 PollResult::Pending {
                     expires_in,
@@ -469,16 +478,16 @@ fn wait_for_callback_or_poll(
                     deadline = deadline.min(Instant::now() + expires_in);
                     interval = clamp_poll_interval(recommended_interval);
                 }
-                PollResult::Transient => {
-                    interval = (interval * 2).min(MAX_POLL_INTERVAL);
+                PollResult::Transient { retry_after } => {
+                    interval = transient_poll_delay(interval, retry_after, deadline);
                 }
             },
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 match poll_authorization_once(registry, pending)? {
-                    PollResult::Ready => {
+                    PollResult::Ready { grant_lifetime } => {
                         gctx.shell()
                             .note("registry authorization ready; continuing")?;
-                        return Ok(());
+                        return Ok(grant_lifetime);
                     }
                     PollResult::Pending {
                         expires_in,
@@ -487,8 +496,8 @@ fn wait_for_callback_or_poll(
                         deadline = deadline.min(Instant::now() + expires_in);
                         interval = clamp_poll_interval(recommended_interval);
                     }
-                    PollResult::Transient => {
-                        interval = (interval * 2).min(MAX_POLL_INTERVAL);
+                    PollResult::Transient { retry_after } => {
+                        interval = transient_poll_delay(interval, retry_after, deadline);
                     }
                 }
                 let elapsed = started.elapsed();
@@ -499,14 +508,13 @@ fn wait_for_callback_or_poll(
                 )?;
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
-                wait_for_poll_ready(
+                return wait_for_poll_ready(
                     gctx,
                     registry,
                     pending,
                     detail,
                     deadline.saturating_duration_since(Instant::now()),
-                )?;
-                return Ok(());
+                );
             }
         }
     }
@@ -518,7 +526,7 @@ fn wait_for_poll_ready(
     pending: &PendingAuthorization,
     detail: &str,
     timeout: Duration,
-) -> CargoResult<()> {
+) -> CargoResult<Duration> {
     let started = Instant::now();
     let mut deadline = started + timeout;
     let mut interval = clamp_poll_interval(pending.recommended_poll_interval_secs);
@@ -547,10 +555,10 @@ fn wait_for_poll_ready(
         )?;
 
         match poll_authorization_once(registry, pending)? {
-            PollResult::Ready => {
+            PollResult::Ready { grant_lifetime } => {
                 gctx.shell()
                     .note("registry authorization ready; continuing")?;
-                return Ok(());
+                return Ok(grant_lifetime);
             }
             PollResult::Pending {
                 expires_in,
@@ -559,8 +567,8 @@ fn wait_for_poll_ready(
                 deadline = deadline.min(Instant::now() + expires_in);
                 interval = clamp_poll_interval(recommended_interval);
             }
-            PollResult::Transient => {
-                interval = (interval * 2).min(MAX_POLL_INTERVAL);
+            PollResult::Transient { retry_after } => {
+                interval = transient_poll_delay(interval, retry_after, deadline);
             }
         }
     }
@@ -571,8 +579,12 @@ enum PollResult {
         expires_in: Duration,
         recommended_interval: Option<u64>,
     },
-    Ready,
-    Transient,
+    Ready {
+        grant_lifetime: Duration,
+    },
+    Transient {
+        retry_after: Option<Duration>,
+    },
 }
 
 fn poll_authorization_once(
@@ -605,29 +617,35 @@ fn poll_authorization_once(
             bail!("mutation authorization record was not found");
         }
         Err(RegistryError::Transport(_) | RegistryError::Timeout(_)) => {
-            return Ok(PollResult::Transient);
+            return Ok(PollResult::Transient { retry_after: None });
         }
-        Err(RegistryError::Code { code, .. } | RegistryError::Api { code, .. })
-            if matches!(
-                code,
-                http::StatusCode::REQUEST_TIMEOUT
-                    | http::StatusCode::TOO_EARLY
-                    | http::StatusCode::TOO_MANY_REQUESTS
-                    | http::StatusCode::INTERNAL_SERVER_ERROR
-                    | http::StatusCode::BAD_GATEWAY
-                    | http::StatusCode::SERVICE_UNAVAILABLE
-                    | http::StatusCode::GATEWAY_TIMEOUT
-            ) =>
+        Err(
+            RegistryError::Code { code, headers, .. } | RegistryError::Api { code, headers, .. },
+        ) if matches!(
+            code,
+            http::StatusCode::REQUEST_TIMEOUT
+                | http::StatusCode::TOO_EARLY
+                | http::StatusCode::TOO_MANY_REQUESTS
+                | http::StatusCode::INTERNAL_SERVER_ERROR
+                | http::StatusCode::BAD_GATEWAY
+                | http::StatusCode::SERVICE_UNAVAILABLE
+                | http::StatusCode::GATEWAY_TIMEOUT
+        ) =>
         {
-            return Ok(PollResult::Transient);
+            return Ok(PollResult::Transient {
+                retry_after: parse_retry_after(code, &headers),
+            });
         }
         Err(err) => return Err(err.into()),
     };
 
     match status.status.as_str() {
         "ready" => {
-            validate_lifetime("grant_expires_in", status.grant_expires_in)?;
-            Ok(PollResult::Ready)
+            let grant_lifetime = Duration::from_secs(validate_lifetime(
+                "grant_expires_in",
+                status.grant_expires_in,
+            )?);
+            Ok(PollResult::Ready { grant_lifetime })
         }
         "pending" => Ok(PollResult::Pending {
             expires_in: Duration::from_secs(validate_lifetime(
@@ -653,10 +671,11 @@ fn poll_authorization_once(
 fn maybe_start_callback_listener(
     gctx: &GlobalContext,
     channel: AuthorizationChannel,
+    loopback_supported: bool,
 ) -> Option<CallbackListener> {
     let use_localhost = match channel {
-        AuthorizationChannel::Auto => prefer_localhost_callback(gctx),
-        AuthorizationChannel::Loopback => true,
+        AuthorizationChannel::Auto => loopback_supported && prefer_localhost_callback(gctx),
+        AuthorizationChannel::Loopback => loopback_supported,
         AuthorizationChannel::Poll | AuthorizationChannel::Disabled => false,
     };
     if !use_localhost {
@@ -751,6 +770,90 @@ fn clamp_poll_interval(recommended_secs: Option<u64>) -> Duration {
         .map(Duration::from_secs)
         .unwrap_or(DEFAULT_POLL_INTERVAL)
         .clamp(MIN_POLL_INTERVAL, MAX_POLL_INTERVAL)
+}
+
+fn transient_poll_delay(
+    previous: Duration,
+    retry_after: Option<Duration>,
+    deadline: Instant,
+) -> Duration {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if let Some(retry_after) = retry_after
+        && retry_after <= remaining
+    {
+        return retry_after;
+    }
+
+    let maximum = (previous * 2).min(MAX_POLL_INTERVAL);
+    let maximum_millis = maximum.as_millis().max(1) as u64;
+    let minimum_millis = (maximum_millis / 2).max(1);
+    Duration::from_millis(rand::rng().random_range(minimum_millis..=maximum_millis))
+}
+
+fn final_request_is_retryable(error: &RegistryError<http_async::Error>) -> bool {
+    match error {
+        RegistryError::Transport(_) | RegistryError::Timeout(_) => true,
+        RegistryError::Code { code, .. } | RegistryError::Api { code, .. } => matches!(
+            *code,
+            http::StatusCode::REQUEST_TIMEOUT
+                | http::StatusCode::TOO_EARLY
+                | http::StatusCode::TOO_MANY_REQUESTS
+                | http::StatusCode::INTERNAL_SERVER_ERROR
+                | http::StatusCode::BAD_GATEWAY
+                | http::StatusCode::SERVICE_UNAVAILABLE
+                | http::StatusCode::GATEWAY_TIMEOUT
+        ),
+        _ => false,
+    }
+}
+
+fn final_request_retry_after(error: &RegistryError<http_async::Error>) -> Option<Duration> {
+    match error {
+        RegistryError::Code { code, headers, .. } | RegistryError::Api { code, headers, .. } => {
+            parse_retry_after(*code, headers)
+        }
+        _ => None,
+    }
+}
+
+fn bounded_retry_delay(retry_after: Option<Duration>, deadline: Instant) -> Option<Duration> {
+    let remaining = deadline.checked_duration_since(Instant::now())?;
+    if let Some(retry_after) = retry_after {
+        return (retry_after <= remaining).then_some(retry_after);
+    }
+    let maximum = remaining.min(Duration::from_millis(750));
+    if maximum.is_zero() {
+        return None;
+    }
+    let maximum_millis = maximum.as_millis().max(1) as u64;
+    Some(Duration::from_millis(
+        rand::rng().random_range(0..=maximum_millis),
+    ))
+}
+
+fn parse_retry_after(code: http::StatusCode, headers: &[String]) -> Option<Duration> {
+    if !matches!(
+        code,
+        http::StatusCode::TOO_MANY_REQUESTS | http::StatusCode::SERVICE_UNAVAILABLE
+    ) {
+        return None;
+    }
+    let value = headers
+        .iter()
+        .filter_map(|header| header.split_once(':'))
+        .find(|(name, _)| name.trim().eq_ignore_ascii_case("retry-after"))?
+        .1
+        .trim();
+    if let Ok(seconds) = value.parse::<u64>() {
+        return Some(Duration::from_secs(seconds));
+    }
+    let retry_at = jiff::fmt::rfc2822::parse(value).ok()?;
+    let milliseconds = jiff::Timestamp::now()
+        .until(&retry_at)
+        .ok()?
+        .total(jiff::Unit::Millisecond)
+        .ok()?;
+    (milliseconds > 0.0).then(|| Duration::from_millis(milliseconds as u64))
 }
 
 fn random_protocol_id(prefix: &str) -> String {
@@ -994,6 +1097,45 @@ mod tests {
             error
                 .to_string()
                 .contains("verification_url must be same-origin, fragment-free")
+        );
+    }
+
+    #[test]
+    fn retry_after_accepts_delta_seconds_only_for_supported_statuses() {
+        let headers = vec!["Retry-After: 7".to_owned()];
+        assert_eq!(
+            parse_retry_after(http::StatusCode::TOO_MANY_REQUESTS, &headers),
+            Some(Duration::from_secs(7))
+        );
+        assert_eq!(
+            parse_retry_after(http::StatusCode::SERVICE_UNAVAILABLE, &headers),
+            Some(Duration::from_secs(7))
+        );
+        assert_eq!(
+            parse_retry_after(http::StatusCode::BAD_GATEWAY, &headers),
+            None
+        );
+    }
+
+    #[test]
+    fn retry_after_accepts_future_http_dates() {
+        let headers = vec!["Retry-After: Wed, 21 Oct 2099 07:28:00 GMT".to_owned()];
+        assert!(
+            parse_retry_after(http::StatusCode::SERVICE_UNAVAILABLE, &headers)
+                .is_some_and(|delay| !delay.is_zero())
+        );
+    }
+
+    #[test]
+    fn final_retry_does_not_outlive_the_grant() {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        assert_eq!(
+            bounded_retry_delay(Some(Duration::from_secs(3)), deadline),
+            None
+        );
+        assert_eq!(
+            bounded_retry_delay(Some(Duration::from_secs(1)), deadline),
+            Some(Duration::from_secs(1))
         );
     }
 

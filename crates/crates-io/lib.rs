@@ -58,8 +58,8 @@ pub struct Registry<T: HttpClient> {
     mutation_authorization_version: Option<u64>,
     /// Whether the registry advertised a mutation-authorization envelope.
     mutation_authorization_advertised: bool,
-    /// Operations for which the registry advertised mutation authorization.
-    mutation_authorization_operations: Vec<String>,
+    /// Independently specified mutation-authorization extensions.
+    mutation_authorization_extensions: Vec<String>,
     /// Extra headers for the final idempotent mutation request.
     mutation_headers: MutationHeaders,
     /// Optional bound for API response bodies while recognizing a reactive challenge.
@@ -477,41 +477,36 @@ impl<T: HttpClient> Registry<T> {
             auth_required,
             mutation_authorization_version: None,
             mutation_authorization_advertised: false,
-            mutation_authorization_operations: Vec::new(),
+            mutation_authorization_extensions: Vec::new(),
             mutation_headers: MutationHeaders::default(),
             response_body_limit: None,
         }
     }
 
     /// Sets mutation-authorization capabilities advertised by registry `config.json`.
-    pub fn set_mutation_authorization(
-        &mut self,
-        versions: impl IntoIterator<Item = u64>,
-        operations: Vec<String>,
-    ) {
+    pub fn set_mutation_authorization(&mut self, version: u64, extensions: Vec<String>) {
         self.mutation_authorization_advertised = true;
-        self.mutation_authorization_version =
-            versions.into_iter().filter(|version| *version == 1).max();
-        self.mutation_authorization_operations = operations;
+        self.mutation_authorization_version = (version == 1).then_some(version);
+        self.mutation_authorization_extensions = extensions;
     }
 
-    /// Whether this registry advertises version 1 for `operation`.
-    pub fn supports_mutation_authorization(&self, operation: &str) -> bool {
+    /// Whether the registry advertised an independently specified extension.
+    pub fn supports_mutation_authorization_extension(&self, extension: &str) -> bool {
         self.mutation_authorization_version == Some(1)
             && self
-                .mutation_authorization_operations
+                .mutation_authorization_extensions
                 .iter()
-                .any(|advertised| advertised == operation)
+                .any(|advertised| advertised == extension)
     }
 
-    /// Whether `operation` is advertised but has no version supported by Cargo.
-    pub fn mutation_authorization_version_unsupported(&self, operation: &str) -> bool {
-        self.mutation_authorization_advertised
-            && self.mutation_authorization_version.is_none()
-            && self
-                .mutation_authorization_operations
-                .iter()
-                .any(|advertised| advertised == operation)
+    /// Whether this registry advertises mutation authorization version 1.
+    pub fn supports_mutation_authorization(&self) -> bool {
+        self.mutation_authorization_version == Some(1)
+    }
+
+    /// Whether mutation authorization is advertised at an unsupported version.
+    pub fn mutation_authorization_version_unsupported(&self) -> bool {
+        self.mutation_authorization_advertised && self.mutation_authorization_version.is_none()
     }
 
     pub fn set_token(&mut self, token: Option<String>) {

@@ -4990,6 +4990,86 @@ fn step_up_preflight_uploads_publish_body_once() {
     assert_eq!(*publish_count2.lock().unwrap(), 1);
 }
 
+/// Core-only registries do not opt Cargo into retrying an ambiguous final request.
+#[cargo_test]
+fn step_up_core_does_not_retry_final_request() {
+    let publish_count = Arc::new(Mutex::new(0u32));
+    let publish_count2 = publish_count.clone();
+    let _registry = RegistryBuilder::new()
+        .alternative()
+        .http_api()
+        .step_up_auth_core()
+        .add_responder("/api/v1/auth/mutation-challenges", |_req, _server| Response {
+            code: 200,
+            headers: vec!["Cache-Control: no-store".into()],
+            body: br#"{"status":"ready","protocol_version":1,"mutation_id":"mut_core_once_01234567890","grant_expires_in":300}"#.to_vec(),
+        })
+        .add_responder("/api/v1/crates/new", move |_req, _server| {
+            *publish_count.lock().unwrap() += 1;
+            Response {
+                code: 503,
+                headers: vec!["Retry-After: 0".into()],
+                body: br#"{"errors":[{"detail":"temporarily unavailable"}]}"#.to_vec(),
+            }
+        })
+        .build();
+
+    let p = project()
+        .file(
+            "Cargo.toml",
+            r#"
+                [package]
+                name = "foo"
+                version = "0.0.1"
+                edition = "2015"
+                authors = []
+                license = "MIT"
+                description = "foo"
+            "#,
+        )
+        .file("src/lib.rs", "")
+        .build();
+
+    p.cargo("publish --no-verify --registry alternative")
+        .with_status(101)
+        .with_stderr_contains("[..]temporarily unavailable[..]")
+        .run();
+    assert_eq!(*publish_count2.lock().unwrap(), 1);
+}
+
+/// Explicit loopback selection fails closed unless the registry advertises it.
+#[cargo_test]
+fn step_up_core_rejects_explicit_loopback() {
+    let _registry = RegistryBuilder::new()
+        .alternative()
+        .http_api()
+        .step_up_auth_core()
+        .build();
+    let p = project()
+        .file(
+            "Cargo.toml",
+            r#"
+                [package]
+                name = "foo"
+                version = "0.0.1"
+                edition = "2015"
+                authors = []
+                license = "MIT"
+                description = "foo"
+            "#,
+        )
+        .file("src/lib.rs", "")
+        .build();
+
+    p.cargo("publish --no-verify --registry alternative")
+        .arg("--registry-authorization=loopback")
+        .with_status(101)
+        .with_stderr_contains(
+            "[..]registry does not advertise the `loopback-callback` authorization extension[..]",
+        )
+        .run();
+}
+
 /// Cargo stops receiving an oversized step-up response before parsing it.
 #[cargo_test]
 fn step_up_rejects_oversized_preflight_response() {

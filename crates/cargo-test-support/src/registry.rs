@@ -161,8 +161,8 @@ pub struct RegistryBuilder {
     token: Option<Token>,
     /// If set, the registry requires authorization for all operations.
     auth_required: bool,
-    /// Whether index config.json advertises mutation authorization version 1.
-    mutation_authorization: bool,
+    /// Optional extension JSON appended to mutation authorization version 1.
+    mutation_authorization_extensions: Option<&'static str>,
     /// If set, serves the index over http.
     http_index: bool,
     /// If set, serves the API over http.
@@ -244,7 +244,7 @@ impl RegistryBuilder {
             alternative: None,
             token: None,
             auth_required: false,
-            mutation_authorization: false,
+            mutation_authorization_extensions: None,
             http_api: false,
             http_index: false,
             api: true,
@@ -330,7 +330,15 @@ impl RegistryBuilder {
     /// Advertises registry mutation authorization version 1 for every v1 operation.
     #[must_use]
     pub fn step_up_auth(mut self) -> Self {
-        self.mutation_authorization = true;
+        self.mutation_authorization_extensions =
+            Some(r#","extensions":["idempotent-final","loopback-callback"]"#);
+        self
+    }
+
+    /// Advertises only core registry mutation authorization version 1.
+    #[must_use]
+    pub fn step_up_auth_core(mut self) -> Self {
+        self.mutation_authorization_extensions = Some("");
         self
     }
 
@@ -528,10 +536,8 @@ impl RegistryBuilder {
             ""
         };
         let mutation_authorization = self
-            .mutation_authorization
-            .then_some(
-                r#","mutation-authorization":{"versions":[1],"operations":["publish","yank","unyank","owners"]}"#,
-            )
+            .mutation_authorization_extensions
+            .map(|extensions| format!(r#","mutation-authorization":{{"version":1{extensions}}}"#))
             .unwrap_or_default();
         let api = if self.api {
             format!(r#","api":"{}""#, registry.api_url)
