@@ -32,130 +32,52 @@ If the response code indicates an error and the content does not have this struc
  message intended to help debugging the server error. A server returning an `errors` object allows a registry to provide a more
 detailed or user-centric error message.
 
-### Interactive additional authentication (`step_up_required`)
+### Mutation authorization
 
-Registries may require additional interactive authentication for publish, yank,
-unyank, or owner changes. Cargo implements the versioned registry exchange;
-the registry chooses the authentication method.
-
-A registry advertises version 1 in its index `config.json`:
+A registry can require additional authorization for publish, yank, unyank, and
+owner changes. It advertises supported versions and operations in index
+`config.json`:
 
 ```json
 {
-    "step-up-auth": 1
+    "mutation-authorization": {
+        "versions": [1],
+        "operations": ["publish", "yank", "unyank", "owners"]
+    }
 }
 ```
 
-The registry must advertise version 1 only after it supports mutation
-preflight and idempotent mutation requests. Before sending the ordinary
-mutation, Cargo sends an authenticated `POST` to
-`/api/v1/auth/challenges` containing an exact mutation descriptor:
+For an advertised operation, Cargo first sends an authenticated `POST` to
+`/api/v1/auth/mutation-challenges`. The JSON body contains protocol version 1,
+a fresh `preflight_id`, `allow_pending`, and an exact mutation descriptor. The
+descriptor binds the method, request target, normalized content type, raw body
+SHA-256 and size, and the operation-specific crate, version, owner, and archive
+facts. A callback-capable client can also register the exact loopback URL
+`http://127.0.0.1:{port}/cargo/registry-authorization`.
 
-```json
-{
-    "protocol_version": 1,
-    "operation": "publish",
-    "method": "PUT",
-    "endpoint": "/api/v1/crates/new",
-    "crate": "example",
-    "version": "1.0.0",
-    "request_sha256": "...",
-    "request_size": 12345,
-    "archive_sha256": "...",
-    "archive_size": 12000
-}
-```
+A `200 OK` response with `status: "ready"` provides a `mutation_id` and
+`grant_expires_in`. A `202 Accepted` response with `status: "pending"` provides
+complete plain-text `detail`, that mutation id, an independent same-origin
+`poll_url`, and `challenge_expires_in`. When `allow_pending` is false and
+authorization would require waiting, the registry returns
+`interaction_required` with `403 Forbidden` and creates no record.
 
-Yank descriptors include the crate and version. Owner-change descriptors
-include the crate, direction, and owners. Every descriptor includes the method,
-endpoint, request hash, and request size.
+Cargo polls without its primary credential. Poll status is `pending`, `ready`,
+`denied`, or `expired`. A loopback callback carries only client-generated
+`state` and causes an immediate poll; it is never proof of authorization.
+Cargo adds the state to the structured same-origin `verification_url` as a URL
+fragment, so it is not sent to the registry.
 
-When no additional authentication is required, or an earlier challenge for the
-same descriptor has been acknowledged, the registry returns:
+After `ready`, Cargo obtains an ordinary primary credential and sends the
+original mutation with `Cargo-Mutation-Id`. The registry checks the credential
+binding and exact descriptor, executes the mutation at most once, and retains
+and replays its terminal response. Preflight never stages an upload or reserves
+a version.
 
-```json
-{
-    "status": "acknowledged",
-    "challenge_id": "stp_...",
-    "expires_at": "2026-01-01T00:00:00Z"
-}
-```
-
-`challenge_id` is the canonical mutation id. Cargo sends it as
-`Cargo-Mutation-Id` on the ordinary mutation and on any bounded transport retry.
-The registry must verify that the credential, method, endpoint, body size, body
-hash, and parsed mutation fields match the preflight descriptor. It must
-serialize concurrent uses of a mutation id and replay a completed response
-instead of executing the mutation again.
-
-When fresh authentication is required, the preflight response uses status
-`403` (valid token, insufficient for the protected operation) and includes:
-
-```javascript
-{
-    "errors": [
-        {
-            "detail": "Additional authentication is required",
-            "id": "step_up_required",
-            "protocol_version": 1,
-            "challenge_id": "stp_…",
-            "operation": "publish",
-            "crate": "example",
-            "poll_url": "https://example.com/api/v1/auth/challenges/stp_…",
-            "expires_at": "2026-01-01T00:00:00Z",
-            "recommended_poll_interval_secs": 5
-        }
-    ]
-}
-```
-
-`detail` contains the human-readable instructions, including the browser URL
-when applicable. Cargo supports two completion channels:
-
-1. Localhost proof, preferred on an interactive terminal. Cargo binds
-   `127.0.0.1`, sends `Cargo-Step-Up-Port` and a client-held
-   `Cargo-Step-Up-Callback-Secret` on the preflight, and adds that secret to the
-   first same-origin instruction URL as a URL fragment. After authentication,
-   the registry page calls the loopback listener with a one-time proof and the
-   callback secret as state. Cargo retries with `Cargo-Step-Up-Proof`.
-2. Polling, used as a concurrent fallback and for remote sessions. Cargo polls
-   `poll_url` until its JSON response has `"status": "acknowledged"`, then
-   retries using the scoped server-side acknowledgment.
-
-Callback-enabled challenges must remain pollable. `poll_url` must share the
-registry API origin, and Cargo does not follow poll redirects.
-`recommended_poll_interval_secs` is advisory and is clamped between 1 and 30
-seconds. Missing or expired challenges should return `404`.
-
-The optional request headers are:
-
-- `Cargo-Step-Up-Port`: loopback port for a one-time proof callback.
-- `Cargo-Step-Up-Callback-Secret`: client secret that authenticates callback
-  state and callback configuration; required with the port.
-- `Cargo-Step-Up-Proof`: one-time proof sent on the final mutation when the
-  callback completes first.
-- `Cargo-Mutation-Id`: acknowledged preflight id sent on the final mutation and
-  its bounded retry.
-
-When `step_up_required` appears and Cargo is non-interactive (`CI=true`/`CI=1`, or
-stdin is not a terminal), Cargo fails fast with a clear error instead of
-waiting on poll or localhost.
-
-`CARGO_REGISTRY_STEP_UP_CHANNEL` selects `auto`, `localhost`, `poll`, or
-`disabled`. Interactive SSH sessions should use `poll` when the browser cannot
-reach the remote host's loopback listener. An explicit `localhost` or `poll`
-choice opts into the interactive wait even when Cargo's TTY/CI heuristic would
-fail fast.
-
-Servers should ignore unexpected query parameters or JSON fields. Cargo only
-enters the interactive flow when `id`, `protocol_version`, `challenge_id`, and
-`poll_url` form the supported version 1 contract. Missing fields and unknown
-versions remain ordinary registry errors.
-
-For compatibility with registries that have not advertised version 1, Cargo
-can also recognize the same `step_up_required` response from an ordinary
-mutation and retry reactively. This may transmit a publish body more than once
-and does not provide the preflight mutation's idempotency guarantees.
+`CARGO_REGISTRY_MUTATION_AUTHORIZATION_CHANNEL` selects `auto`, `loopback`,
+`poll`, or `disabled`. In non-interactive `auto` mode Cargo still preflights
+with `allow_pending: false`, allowing policy-exempt credentials to proceed
+without creating an abandoned challenge.
 
 Cargo sets the `User-Agent` header for all requests to the Cargo version such
 as `cargo/1.32.0 (8610973aa 2019-01-02)`. This may be modified by the user in

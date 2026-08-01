@@ -19,6 +19,14 @@ pub fn cli() -> Command {
         ))
         .arg_index("Registry index URL to yank from")
         .arg_registry("Registry to yank from")
+        .arg(
+            opt(
+                "registry-authorization",
+                "Select registry mutation authorization channel",
+            )
+            .value_name("CHANNEL")
+            .value_parser(["auto", "loopback", "poll", "disabled"]),
+        )
         .arg(opt("token", "API token to use when authenticating").value_name("TOKEN"))
         .arg_silent_suggestion()
         .after_help(color_print::cstr!(
@@ -41,6 +49,7 @@ pub fn exec(gctx: &mut GlobalContext, args: &ArgMatches) -> CliResult {
         version.map(|s| s.to_string()),
         args.get_one::<String>("token").cloned().map(Secret::from),
         args.registry_or_index(gctx)?,
+        args.get_one::<String>("registry-authorization").cloned(),
         args.flag("undo"),
     )?;
     Ok(())

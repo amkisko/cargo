@@ -293,12 +293,22 @@ pub struct RegistryConfig {
     #[serde(default)]
     pub auth_required: bool,
 
-    /// Version of the registry step-up authentication protocol.
+    /// Supported versions and operations for registry mutation authorization.
     ///
-    /// Registries advertise this only after both mutation preflight and
-    /// idempotent mutation requests are supported.
+    /// Registries advertise an operation only after both mutation preflight and
+    /// idempotent final requests implement the selected protocol version.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub step_up_auth: Option<u64>,
+    pub mutation_authorization: Option<MutationAuthorization>,
+}
+
+/// Registry mutation-authorization capabilities advertised by `config.json`.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[cfg_attr(feature = "unstable-schema", derive(schemars::JsonSchema))]
+pub struct MutationAuthorization {
+    /// Protocol versions supported by the registry.
+    pub versions: Vec<u64>,
+    /// Ordinary registry mutations protected by the protocol.
+    pub operations: Vec<String>,
 }
 
 impl RegistryConfig {

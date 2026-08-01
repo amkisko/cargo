@@ -59,6 +59,7 @@ pub struct PublishOpts<'gctx> {
     pub gctx: &'gctx GlobalContext,
     pub token: Option<Secret<String>>,
     pub reg_or_index: Option<RegistryOrIndex>,
+    pub registry_authorization: Option<String>,
     pub verify: bool,
     pub allow_dirty: bool,
     pub jobs: Option<JobsConfig>,
@@ -266,6 +267,8 @@ pub fn publish(ws: &Workspace<'_>, opts: &PublishOpts<'_>) -> CargoResult<()> {
                 tarball.file(),
                 &mut registry,
                 source_ids.original,
+                opts.reg_or_index.as_ref(),
+                opts.registry_authorization.as_deref(),
                 opts.dry_run,
                 workspace_context,
             )?;
@@ -653,6 +656,8 @@ fn transmit(
     tarball: &File,
     registry: &mut Registry<RegistryClient<'_>>,
     registry_id: SourceId,
+    reg_or_index: Option<&RegistryOrIndex>,
+    registry_authorization: Option<&str>,
     dry_run: bool,
     workspace_context: impl Fn() -> String,
 ) -> CargoResult<()> {
@@ -684,9 +689,14 @@ fn transmit(
         &body,
         tarball_len,
     );
-    let warnings = super::step_up::with_step_up_retry(gctx, registry, descriptor, |registry| {
-        registry.publish_body(&body, tarball_len)
-    })
+    let warnings = super::step_up::with_step_up_retry(
+        gctx,
+        registry,
+        reg_or_index,
+        registry_authorization,
+        descriptor,
+        |registry| registry.publish_body(&body, tarball_len),
+    )
     .with_context(|| {
         format!(
             "failed to publish {} v{} to registry at {}{}",

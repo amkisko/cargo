@@ -26,6 +26,14 @@ pub fn cli() -> Command {
         .arg(flag("list", "List owners of a crate").short('l'))
         .arg_index("Registry index URL to modify owners for")
         .arg_registry("Registry to modify owners for")
+        .arg(
+            opt(
+                "registry-authorization",
+                "Select registry mutation authorization channel",
+            )
+            .value_name("CHANNEL")
+            .value_parser(["auto", "loopback", "poll", "disabled"]),
+        )
         .arg(opt("token", "API token to use when authenticating").value_name("TOKEN"))
         .arg_silent_suggestion()
         .after_help(color_print::cstr!(
@@ -38,6 +46,7 @@ pub fn exec(gctx: &mut GlobalContext, args: &ArgMatches) -> CliResult {
         krate: args.get_one::<String>("crate").cloned(),
         token: args.get_one::<String>("token").cloned().map(Secret::from),
         reg_or_index: args.registry_or_index(gctx)?,
+        registry_authorization: args.get_one::<String>("registry-authorization").cloned(),
         to_add: args
             .get_many::<String>("add")
             .map(|xs| xs.cloned().collect()),

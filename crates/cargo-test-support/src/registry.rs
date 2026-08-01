@@ -161,8 +161,8 @@ pub struct RegistryBuilder {
     token: Option<Token>,
     /// If set, the registry requires authorization for all operations.
     auth_required: bool,
-    /// Step-up protocol version advertised by index config.json.
-    step_up_auth: Option<u64>,
+    /// Whether index config.json advertises mutation authorization version 1.
+    mutation_authorization: bool,
     /// If set, serves the index over http.
     http_index: bool,
     /// If set, serves the API over http.
@@ -244,7 +244,7 @@ impl RegistryBuilder {
             alternative: None,
             token: None,
             auth_required: false,
-            step_up_auth: None,
+            mutation_authorization: false,
             http_api: false,
             http_index: false,
             api: true,
@@ -327,10 +327,10 @@ impl RegistryBuilder {
         self
     }
 
-    /// Advertises idempotency-first registry step-up protocol version 1.
+    /// Advertises registry mutation authorization version 1 for every v1 operation.
     #[must_use]
     pub fn step_up_auth(mut self) -> Self {
-        self.step_up_auth = Some(1);
+        self.mutation_authorization = true;
         self
     }
 
@@ -527,9 +527,11 @@ impl RegistryBuilder {
         } else {
             ""
         };
-        let step_up_auth = self
-            .step_up_auth
-            .map(|version| format!(r#","step-up-auth":{version}"#))
+        let mutation_authorization = self
+            .mutation_authorization
+            .then_some(
+                r#","mutation-authorization":{"versions":[1],"operations":["publish","yank","unyank","owners"]}"#,
+            )
             .unwrap_or_default();
         let api = if self.api {
             format!(r#","api":"{}""#, registry.api_url)
@@ -540,7 +542,10 @@ impl RegistryBuilder {
         repo(&registry.path)
             .file(
                 "config.json",
-                &format!(r#"{{"dl":"{}"{api}{auth}{step_up_auth}}}"#, registry.dl_url),
+                &format!(
+                    r#"{{"dl":"{}"{api}{auth}{mutation_authorization}}}"#,
+                    registry.dl_url
+                ),
             )
             .build();
         fs::create_dir_all(api_path.join("api/v1/crates")).unwrap();

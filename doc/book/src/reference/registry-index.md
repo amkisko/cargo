@@ -38,12 +38,11 @@ The keys are:
 - `auth-required`: indicates whether this is a private registry that requires
   all operations to be authenticated including API requests, crate downloads
   and sparse index updates.
-- `step-up-auth`: advertises the supported version of the registry's
-  [interactive additional authentication] protocol. A registry should set this
-  to `1` only after it supports mutation preflight and idempotent mutation
-  requests.
+- `mutation-authorization`: advertises supported protocol `versions` and
+  protected `operations`. A registry should list an operation only after its
+  preflight and idempotent final endpoint implement that version.
 
-[interactive additional authentication]: registry-web-api.md#interactive-additional-authentication-step_up_required
+[mutation authorization]: registry-web-api.md#mutation-authorization
 
 
 ## Download Endpoint

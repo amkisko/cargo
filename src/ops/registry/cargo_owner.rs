@@ -19,6 +19,7 @@ pub struct OwnersOptions {
     pub krate: Option<String>,
     pub token: Option<Secret<String>>,
     pub reg_or_index: Option<RegistryOrIndex>,
+    pub registry_authorization: Option<String>,
     pub to_add: Option<Vec<String>>,
     pub to_remove: Option<Vec<String>>,
     pub list: bool,
@@ -48,9 +49,14 @@ pub fn modify_owners(gctx: &GlobalContext, opts: &OwnersOptions) -> CargoResult<
     if let Some(ref v) = opts.to_add {
         let v = v.iter().map(|s| &s[..]).collect::<Vec<_>>();
         let descriptor = crates_io::MutationDescriptor::owners(&name, &v, true)?;
-        let msg = super::step_up::with_step_up_retry(gctx, &mut registry, descriptor, |registry| {
-            registry.add_owners(&name, &v)
-        })
+        let msg = super::step_up::with_step_up_retry(
+            gctx,
+            &mut registry,
+            opts.reg_or_index.as_ref(),
+            opts.registry_authorization.as_deref(),
+            descriptor,
+            |registry| registry.add_owners(&name, &v),
+        )
         .with_context(|| {
             format!(
                 "failed to invite owners to crate `{}` on registry at {}",
@@ -67,9 +73,14 @@ pub fn modify_owners(gctx: &GlobalContext, opts: &OwnersOptions) -> CargoResult<
         gctx.shell()
             .status("Owner", format!("removing {:?} from crate {}", v, name))?;
         let descriptor = crates_io::MutationDescriptor::owners(&name, &v, false)?;
-        super::step_up::with_step_up_retry(gctx, &mut registry, descriptor, |registry| {
-            registry.remove_owners(&name, &v)
-        })
+        super::step_up::with_step_up_retry(
+            gctx,
+            &mut registry,
+            opts.reg_or_index.as_ref(),
+            opts.registry_authorization.as_deref(),
+            descriptor,
+            |registry| registry.remove_owners(&name, &v),
+        )
         .with_context(|| {
             format!(
                 "failed to remove owners from crate `{}` on registry at {}",

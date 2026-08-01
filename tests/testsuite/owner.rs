@@ -194,7 +194,7 @@ fn simple_remove_with_asymmetric() {
         .run();
 }
 
-/// Registry returns `step_up_required`; Cargo polls until acknowledged, then retries owner add.
+/// Cargo binds an advertised owner change before sending it.
 #[cargo_test]
 fn step_up_required_then_retry() {
     let owner_count = Arc::new(Mutex::new(0u32));
@@ -202,38 +202,44 @@ fn step_up_required_then_retry() {
 
     let registry = RegistryBuilder::new()
         .http_api()
+        .step_up_auth()
+        .add_responder(
+            "/api/v1/auth/mutation-challenges",
+            move |req, _server| {
+                let origin = req.url.origin().ascii_serialization();
+                let descriptor: serde_json::Value =
+                    serde_json::from_slice(req.body.as_deref().unwrap()).unwrap();
+                assert_eq!(descriptor["operation"], "owners");
+                assert_eq!(descriptor["content_type"], "application/json");
+                let body = format!(
+                    r#"{{"status":"pending","detail":"Authorize this owner change.","protocol_version":1,"mutation_id":"mut_owners_01234567890123","poll_url":"{origin}/api/v1/auth/mutation-challenges/poll/poll_owners_01234567","challenge_expires_in":300,"recommended_poll_interval_secs":1}}"#
+                );
+                Response {
+                    code: 202,
+                    headers: vec!["Cache-Control: no-store".into()],
+                    body: body.into_bytes(),
+                }
+            },
+        )
         .add_responder("/api/v1/crates/foo/owners", move |req, server| {
             if req.method != "put" {
                 return server.ok(req);
             }
             let mut n = owner_count.lock().unwrap();
             *n += 1;
-            if *n == 1 {
-                let origin = req.url.origin().ascii_serialization();
-                let body = format!(
-                    r#"{{"errors":[{{"detail":"Additional authentication is required. Visit {origin}/verify/stp_owners.","id":"step_up_required","protocol_version":1,"challenge_id":"stp_owners","operation":"change-owners","crate":"foo","poll_url":"{origin}/api/v1/auth/challenges/stp_owners","expires_at":"2099-01-01T00:00:00Z","recommended_poll_interval_secs":1}}]}}"#
-                );
-                Response {
-                    code: 403,
-                    headers: vec![],
-                    body: body.into_bytes(),
-                }
-            } else {
-                server.ok(req)
-            }
+            assert_eq!(
+                req.cargo_mutation_id.as_deref(),
+                Some("mut_owners_01234567890123")
+            );
+            server.ok(req)
         })
-        .add_responder("/api/v1/auth/challenges/stp_owners", move |_req, _server| {
+        .add_responder("/api/v1/auth/mutation-challenges/poll/poll_owners_01234567", move |_req, _server| {
             let mut n = poll_count.lock().unwrap();
             *n += 1;
-            let status = if *n == 1 { "pending" } else { "acknowledged" };
-            let acknowledged = status == "acknowledged";
-            let body = format!(
-                r#"{{"challenge_id":"stp_owners","status":"{status}","acknowledged":{acknowledged},"verified":{acknowledged},"operation":"change-owners","crate_name":"foo","expires_at":"2099-01-01T00:00:00Z","localhost_port":null,"recommended_poll_interval_secs":1}}"#
-            );
             Response {
                 code: 200,
-                headers: vec![],
-                body: body.into_bytes(),
+                headers: vec!["Cache-Control: no-store".into()],
+                body: br#"{"status":"ready","grant_expires_in":300}"#.to_vec(),
             }
         })
         .build();
@@ -253,16 +259,8 @@ fn step_up_required_then_retry() {
         .file("src/main.rs", "fn main() {}")
         .build();
 
-    p.cargo("owner -a username")
+    p.cargo("owner -a username --registry-authorization=poll")
         .replace_crates_io(registry.index_url())
-        .env("CARGO_REGISTRY_STEP_UP_CHANNEL", "poll")
-        .with_stderr_data(str![[r#"
-[UPDATING] crates.io index
-[NOTE] Instructions from registry http://127.0.0.1:[..]:
-      Additional authentication is required. Visit http://127.0.0.1:[..]/verify/stp_owners.
-[NOTE] step-up acknowledged; retrying request
-[OWNER] completed!
-
-"#]])
+        .with_stderr_contains("[NOTE] registry authorization ready; continuing")
         .run();
 }

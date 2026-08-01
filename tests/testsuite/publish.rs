@@ -4914,107 +4914,6 @@ fn workspace_circular_publish_dependency_with_non_cycle_package() {
         .run();
 }
 
-/// Callback delivery never arrives; Cargo polls the same challenge and retries.
-#[cargo_test]
-fn step_up_callback_falls_back_to_poll_then_retry() {
-    let publish_count = Arc::new(Mutex::new(0u32));
-    let poll_count = Arc::new(Mutex::new(0u32));
-    let poll_auths = Arc::new(Mutex::new(Vec::new()));
-    let poll_auths2 = poll_auths.clone();
-
-    let _registry = RegistryBuilder::new()
-        .alternative()
-        .http_api()
-        .add_responder("/api/v1/crates/new", move |req, server| {
-            let mut n = publish_count.lock().unwrap();
-            *n += 1;
-            if *n == 1 {
-                assert!(
-                    req.cargo_step_up_port.is_some(),
-                    "forced localhost channel should advertise a callback port"
-                );
-                assert!(
-                    req.cargo_step_up_callback_secret.is_some(),
-                    "callback port must have listener state"
-                );
-                let origin = req.url.origin().ascii_serialization();
-                let body = format!(
-                    r#"{{"errors":[{{"detail":"Additional authentication is required. Visit {origin}/verify/stp_testop.","id":"step_up_required","protocol_version":1,"challenge_id":"stp_testop","operation":"publish","crate":"foo","poll_url":"{origin}/api/v1/auth/challenges/stp_testop","expires_at":"2099-01-01T00:00:00Z","recommended_poll_interval_secs":1}}]}}"#
-                );
-                Response {
-                    // crates.io compatibility middleware rewrites this error to 200.
-                    code: 200,
-                    headers: vec![],
-                    body: body.into_bytes(),
-                }
-            } else {
-                server.check_authorized_publish(req)
-            }
-        })
-        .add_responder("/api/v1/auth/challenges/stp_testop", move |req, _server| {
-            poll_auths
-                .lock()
-                .unwrap()
-                .push(req.authorization.clone());
-            let mut n = poll_count.lock().unwrap();
-            *n += 1;
-            let status = if *n == 1 { "pending" } else { "acknowledged" };
-            let acknowledged = status == "acknowledged";
-            let body = format!(
-                r#"{{"challenge_id":"stp_testop","status":"{status}","acknowledged":{acknowledged},"verified":{acknowledged},"operation":"publish","crate_name":"foo","expires_at":"2099-01-01T00:00:00Z","localhost_port":null,"recommended_poll_interval_secs":1}}"#
-            );
-            Response {
-                code: 200,
-                headers: vec![],
-                body: body.into_bytes(),
-            }
-        })
-        .build();
-
-    let p = project()
-        .file(
-            "Cargo.toml",
-            r#"
-                [package]
-                name = "foo"
-                version = "0.0.1"
-                edition = "2015"
-                authors = []
-                license = "MIT"
-                description = "foo"
-                documentation = "foo"
-                homepage = "foo"
-                repository = "foo"
-            "#,
-        )
-        .file("src/lib.rs", "")
-        .build();
-
-    p.cargo("publish --no-verify --registry alternative")
-        .env("CARGO_REGISTRY_STEP_UP_CHANNEL", "localhost")
-        .with_stderr_data(str![[r#"
-[UPDATING] `alternative` index
-[PACKAGING] foo v0.0.1 ([..]foo)
-[PACKAGED] 4 files, [FILE_SIZE]B ([FILE_SIZE]B compressed)
-[UPLOADING] foo v0.0.1 ([..]foo)
-[NOTE] Instructions from registry http://127.0.0.1:[..]:
-      Additional authentication is required. Visit http://127.0.0.1:[..]/verify/stp_testop#callback_secret=[..].
-[NOTE] step-up acknowledged; retrying request
-[UPLOADED] foo v0.0.1 to registry `alternative`
-[NOTE] waiting for foo v0.0.1 to be available at registry `alternative`
-[HELP] you may press ctrl-c to skip waiting; the crate should be available shortly
-[PUBLISHED] foo v0.0.1 at registry `alternative`
-
-"#]])
-        .run();
-
-    let auths = poll_auths2.lock().unwrap();
-    assert!(
-        auths.iter().all(Option::is_none),
-        "step-up poll requests must not include a mutation credential: {auths:?}"
-    );
-}
-
 /// Version 1 registries receive a descriptor before Cargo uploads the archive.
 #[cargo_test]
 fn step_up_preflight_uploads_publish_body_once() {
@@ -5027,16 +4926,19 @@ fn step_up_preflight_uploads_publish_body_once() {
         .alternative()
         .http_api()
         .step_up_auth()
-        .add_responder("/api/v1/auth/challenges", move |req, _server| {
+        .add_responder("/api/v1/auth/mutation-challenges", move |req, _server| {
             *preflight_count.lock().unwrap() += 1;
             assert_eq!(req.method, "post");
             assert!(req.cargo_mutation_id.is_none());
             let descriptor: serde_json::Value =
                 serde_json::from_slice(req.body.as_deref().unwrap()).unwrap();
             assert_eq!(descriptor["protocol_version"], 1);
+            assert_eq!(descriptor["allow_pending"], false);
+            assert!(descriptor["preflight_id"].as_str().unwrap().starts_with("pf_"));
             assert_eq!(descriptor["operation"], "publish");
             assert_eq!(descriptor["method"], "PUT");
-            assert_eq!(descriptor["endpoint"], "/api/v1/crates/new");
+            assert_eq!(descriptor["request_target"], "/api/v1/crates/new");
+            assert_eq!(descriptor["content_type"], "application/octet-stream");
             assert_eq!(descriptor["crate"], "foo");
             assert_eq!(descriptor["version"], "0.0.1");
             assert_eq!(descriptor["request_sha256"].as_str().unwrap().len(), 64);
@@ -5049,12 +4951,15 @@ fn step_up_preflight_uploads_publish_body_once() {
             Response {
                 code: 200,
                 headers: vec!["Cache-Control: no-store".into()],
-                body: br#"{"status":"acknowledged","challenge_id":"stp_publish_once","expires_at":"2099-01-01T00:00:00Z"}"#.to_vec(),
+                body: br#"{"status":"ready","protocol_version":1,"mutation_id":"mut_publish_once_0123456789","grant_expires_in":300}"#.to_vec(),
             }
         })
         .add_responder("/api/v1/crates/new", move |req, server| {
             *publish_count.lock().unwrap() += 1;
-            assert_eq!(req.cargo_mutation_id.as_deref(), Some("stp_publish_once"));
+            assert_eq!(
+                req.cargo_mutation_id.as_deref(),
+                Some("mut_publish_once_0123456789")
+            );
             server.check_authorized_publish(req)
         })
         .build();
@@ -5092,10 +4997,12 @@ fn step_up_rejects_oversized_preflight_response() {
         .alternative()
         .http_api()
         .step_up_auth()
-        .add_responder("/api/v1/auth/challenges", |_req, _server| Response {
-            code: 403,
-            headers: vec!["Cache-Control: no-store".into()],
-            body: vec![b'x'; crates_io::STEP_UP_RESPONSE_MAX_BYTES + 1],
+        .add_responder("/api/v1/auth/mutation-challenges", |_req, _server| {
+            Response {
+                code: 403,
+                headers: vec!["Cache-Control: no-store".into()],
+                body: vec![b'x'; crates_io::STEP_UP_RESPONSE_MAX_BYTES + 1],
+            }
         })
         .build();
 
@@ -5121,25 +5028,26 @@ fn step_up_rejects_oversized_preflight_response() {
         .run();
 }
 
-/// Cargo refuses HTTP redirects on step-up poll URLs (SSRF via Location).
+/// Cargo refuses HTTP redirects on mutation-authorization poll URLs.
 #[cargo_test]
 fn step_up_rejects_poll_redirect() {
     let _registry = RegistryBuilder::new()
         .alternative()
         .http_api()
-        .add_responder("/api/v1/crates/new", |req, _server| {
+        .step_up_auth()
+        .add_responder("/api/v1/auth/mutation-challenges", |req, _server| {
             let origin = req.url.origin().ascii_serialization();
             let body = format!(
-                r#"{{"errors":[{{"detail":"Additional authentication is required. Visit {origin}/verify/stp_redir.","id":"step_up_required","protocol_version":1,"challenge_id":"stp_redir","operation":"publish","crate":"foo","poll_url":"{origin}/api/v1/auth/challenges/stp_redir","expires_at":"2099-01-01T00:00:00Z","recommended_poll_interval_secs":1}}]}}"#
+                r#"{{"status":"pending","detail":"Authorize this publish.","protocol_version":1,"mutation_id":"mut_redir_0123456789012345","poll_url":"{origin}/api/v1/auth/mutation-challenges/poll/poll_redir_0123456789","challenge_expires_in":300,"recommended_poll_interval_secs":1}}"#
             );
             Response {
-                code: 403,
-                headers: vec![],
+                code: 202,
+                headers: vec!["Cache-Control: no-store".into()],
                 body: body.into_bytes(),
             }
         })
         .add_responder(
-            "/api/v1/auth/challenges/stp_redir",
+            "/api/v1/auth/mutation-challenges/poll/poll_redir_0123456789",
             |_req, _server| Response {
                 code: 302,
                 headers: vec!["Location: http://127.0.0.1:9/".to_string()],
@@ -5168,39 +5076,26 @@ fn step_up_rejects_poll_redirect() {
         .build();
 
     p.cargo("publish --no-verify --registry alternative")
-        .env("CARGO_STEP_UP_INTERACTIVE", "1")
+        .arg("--registry-authorization=poll")
         .with_status(101)
-        .with_stderr_data(str![[r#"
-[UPDATING] `alternative` index
-[PACKAGING] foo v0.0.1 ([..]foo)
-[PACKAGED] 4 files, [FILE_SIZE]B ([FILE_SIZE]B compressed)
-[UPLOADING] foo v0.0.1 ([..]foo)
-[NOTE] Instructions from registry http://127.0.0.1:[..]:
-      Additional authentication is required. Visit http://127.0.0.1:[..]/verify/stp_redir.
-[ERROR] failed to publish foo v0.0.1 to registry at http://127.0.0.1:[..]/
-
-Caused by:
-  refusing to follow step-up poll redirect from `http://127.0.0.1:[..]/api/v1/auth/challenges/stp_redir` to `http://127.0.0.1:9/`
-
-"#]])
+        .with_stderr_contains(
+            "[..]refusing to follow mutation-authorization poll redirect from [..] to [..][..]",
+        )
         .run();
 }
 
-/// Cargo refuses step-up poll URLs that do not share the registry API origin.
+/// Cargo refuses poll URLs that do not share the registry API origin.
 #[cargo_test]
 fn step_up_rejects_cross_origin_poll_url() {
     let _registry = RegistryBuilder::new()
         .alternative()
         .http_api()
-        .add_responder("/api/v1/crates/new", |req, _server| {
-            let origin = req.url.origin().ascii_serialization();
-            let body = format!(
-                r#"{{"errors":[{{"detail":"Additional authentication is required. Visit {origin}/verify/stp_evil.","id":"step_up_required","protocol_version":1,"challenge_id":"stp_evil","operation":"publish","crate":"foo","poll_url":"http://127.0.0.1:9/evil","expires_at":"2099-01-01T00:00:00Z","recommended_poll_interval_secs":1}}]}}"#
-            );
+        .step_up_auth()
+        .add_responder("/api/v1/auth/mutation-challenges", |_req, _server| {
             Response {
-                code: 403,
-                headers: vec![],
-                body: body.into_bytes(),
+                code: 202,
+                headers: vec!["Cache-Control: no-store".into()],
+                body: br#"{"status":"pending","detail":"Authorize this publish.","protocol_version":1,"mutation_id":"mut_evil_01234567890123456","poll_url":"http://127.0.0.1:9/evil","challenge_expires_in":300,"recommended_poll_interval_secs":1}"#.to_vec(),
             }
         })
         .build();
@@ -5225,44 +5120,40 @@ fn step_up_rejects_cross_origin_poll_url() {
         .build();
 
     p.cargo("publish --no-verify --registry alternative")
-        .env("CARGO_STEP_UP_INTERACTIVE", "1")
+        .arg("--registry-authorization=poll")
         .with_status(101)
-        .with_stderr_data(str![[r#"
-[UPDATING] `alternative` index
-[PACKAGING] foo v0.0.1 ([..]foo)
-[PACKAGED] 4 files, [FILE_SIZE]B ([FILE_SIZE]B compressed)
-[UPLOADING] foo v0.0.1 ([..]foo)
-[ERROR] failed to publish foo v0.0.1 to registry at http://127.0.0.1:[..]/
-
-Caused by:
-  refusing to poll step-up status at `http://127.0.0.1:9/evil`; URL must use the same origin as the registry API (http://127.0.0.1:[..])
-
-"#]])
+        .with_stderr_contains(
+            "[..]mutation authorization poll_url must share the registry API origin[..]",
+        )
         .run();
 }
 
-/// Expired/missing step-up challenge (poll 404) fails with an actionable error.
+/// A missing mutation-authorization record fails with an actionable error.
 #[cargo_test]
 fn step_up_poll_not_found() {
     let _registry = RegistryBuilder::new()
         .alternative()
         .http_api()
-        .add_responder("/api/v1/crates/new", |req, _server| {
+        .step_up_auth()
+        .add_responder("/api/v1/auth/mutation-challenges", |req, _server| {
             let origin = req.url.origin().ascii_serialization();
             let body = format!(
-                r#"{{"errors":[{{"detail":"Additional authentication is required. Visit {origin}/verify/stp_gone and retry the original command.","id":"step_up_required","protocol_version":1,"challenge_id":"stp_gone","operation":"publish","crate":"foo","poll_url":"{origin}/api/v1/auth/challenges/stp_gone","expires_at":"2099-01-01T00:00:00Z","recommended_poll_interval_secs":1}}]}}"#
+                r#"{{"status":"pending","detail":"Authorize this publish.","protocol_version":1,"mutation_id":"mut_gone_01234567890123456","poll_url":"{origin}/api/v1/auth/mutation-challenges/poll/poll_gone_01234567890","challenge_expires_in":300,"recommended_poll_interval_secs":1}}"#
             );
             Response {
-                code: 403,
-                headers: vec![],
+                code: 202,
+                headers: vec!["Cache-Control: no-store".into()],
                 body: body.into_bytes(),
             }
         })
-        .add_responder("/api/v1/auth/challenges/stp_gone", |_req, _server| Response {
-            code: 404,
-            headers: vec![],
-            body: br#"{"errors":[{"detail":"not found"}]}"#.to_vec(),
-        })
+        .add_responder(
+            "/api/v1/auth/mutation-challenges/poll/poll_gone_01234567890",
+            |_req, _server| Response {
+                code: 404,
+                headers: vec!["Cache-Control: no-store".into()],
+                body: br#"{"errors":[{"detail":"not found"}]}"#.to_vec(),
+            },
+        )
         .build();
 
     let p = project()
@@ -5285,161 +5176,27 @@ fn step_up_poll_not_found() {
         .build();
 
     p.cargo("publish --no-verify --registry alternative")
-        .env("CARGO_STEP_UP_INTERACTIVE", "1")
+        .arg("--registry-authorization=poll")
         .with_status(101)
-        .with_stderr_data(str![[r#"
-[UPDATING] `alternative` index
-[PACKAGING] foo v0.0.1 ([..]foo)
-[PACKAGED] 4 files, [FILE_SIZE]B ([FILE_SIZE]B compressed)
-[UPLOADING] foo v0.0.1 ([..]foo)
-[NOTE] Instructions from registry http://127.0.0.1:[..]:
-      Additional authentication is required. Visit http://127.0.0.1:[..]/verify/stp_gone and retry the original command.
-[ERROR] failed to publish foo v0.0.1 to registry at http://127.0.0.1:[..]/
-
-Caused by:
-  step-up challenge expired or was not found
-
-"#]])
+        .with_stderr_contains("[..]mutation authorization record was not found[..]")
         .run();
 }
 
-/// Registry returns `step_up_required`; Cargo receives a localhost proof and retries.
-#[cargo_test]
-fn step_up_localhost_otp_then_retry() {
-    let publish_count = Arc::new(Mutex::new(0u32));
-    let seen_port = Arc::new(Mutex::new(None::<u16>));
-    let seen_callback_secret = Arc::new(Mutex::new(None::<String>));
-    let seen_otp = Arc::new(Mutex::new(None::<String>));
-    let seen_port2 = seen_port.clone();
-    let seen_callback_secret2 = seen_callback_secret.clone();
-    let seen_otp2 = seen_otp.clone();
-
-    let _registry = RegistryBuilder::new()
-        .alternative()
-        .http_api()
-        .add_responder("/api/v1/crates/new", move |req, server| {
-            let mut n = publish_count.lock().unwrap();
-            *n += 1;
-            if *n == 1 {
-                let port = req
-                    .cargo_step_up_port
-                    .as_deref()
-                    .and_then(|p| p.parse::<u16>().ok())
-                    .expect("first publish should send Cargo-Step-Up-Port");
-                *seen_port.lock().unwrap() = Some(port);
-                let callback_secret = req
-                    .cargo_step_up_callback_secret
-                    .clone()
-                    .expect("first publish should send Cargo-Step-Up-Callback-Secret");
-                assert_eq!(callback_secret.len(), 32);
-                *seen_callback_secret.lock().unwrap() = Some(callback_secret.clone());
-                // Simulate the verify page hitting `/?code=` on cargo's listener.
-                std::thread::spawn(move || {
-                    std::thread::sleep(std::time::Duration::from_millis(50));
-                    if let Ok(mut stream) = std::net::TcpStream::connect(("127.0.0.1", port)) {
-                        use std::io::Write;
-                        let _ = write!(
-                            stream,
-                            "GET /?code=TestProof0123456789abcdef&state={callback_secret} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
-                        );
-                    }
-                });
-                let origin = req.url.origin().ascii_serialization();
-                let body = format!(
-                    r#"{{"errors":[{{"detail":"Additional authentication is required. Visit {origin}/verify/stp_otp.","id":"step_up_required","protocol_version":1,"challenge_id":"stp_otp","operation":"publish","crate":"foo","poll_url":"{origin}/api/v1/auth/challenges/stp_otp","expires_at":"2099-01-01T00:00:00Z","recommended_poll_interval_secs":1}}]}}"#
-                );
-                Response {
-                    code: 403,
-                    headers: vec![],
-                    body: body.into_bytes(),
-                }
-            } else {
-                assert_eq!(
-                    req.cargo_step_up_callback_secret,
-                    *seen_callback_secret.lock().unwrap(),
-                    "retry should preserve the callback secret"
-                );
-                *seen_otp.lock().unwrap() = req.cargo_step_up_proof.clone();
-                assert_eq!(
-                    req.cargo_step_up_proof.as_deref(),
-                    Some("TestProof0123456789abcdef"),
-                    "retry should send Cargo-Step-Up-Proof"
-                );
-                server.check_authorized_publish(req)
-            }
-        })
-        .build();
-
-    let p = project()
-        .file(
-            "Cargo.toml",
-            r#"
-                [package]
-                name = "foo"
-                version = "0.0.1"
-                edition = "2015"
-                authors = []
-                license = "MIT"
-                description = "foo"
-                documentation = "foo"
-                homepage = "foo"
-                repository = "foo"
-            "#,
-        )
-        .file("src/lib.rs", "")
-        .build();
-
-    p.cargo("publish --no-verify --registry alternative")
-        .env("CARGO_STEP_UP_PREFER_LOCALHOST", "1")
-        .with_stderr_data(str![[r#"
-[UPDATING] `alternative` index
-[PACKAGING] foo v0.0.1 ([..]foo)
-[PACKAGED] 4 files, [FILE_SIZE]B ([FILE_SIZE]B compressed)
-[UPLOADING] foo v0.0.1 ([..]foo)
-[NOTE] Instructions from registry http://127.0.0.1:[..]:
-      Additional authentication is required. Visit http://127.0.0.1:[..]/verify/stp_otp#callback_secret=[..].
-[NOTE] step-up proof received; retrying request
-[UPLOADED] foo v0.0.1 to registry `alternative`
-[NOTE] waiting for foo v0.0.1 to be available at registry `alternative`
-[HELP] you may press ctrl-c to skip waiting; the crate should be available shortly
-[PUBLISHED] foo v0.0.1 at registry `alternative`
-
-"#]])
-        .run();
-
-    assert!(
-        seen_port2.lock().unwrap().is_some_and(|p| p >= 1024),
-        "expected Cargo-Step-Up-Port >= 1024"
-    );
-    assert_eq!(
-        seen_callback_secret2
-            .lock()
-            .unwrap()
-            .as_deref()
-            .map(str::len),
-        Some(32)
-    );
-    assert_eq!(
-        seen_otp2.lock().unwrap().as_deref(),
-        Some("TestProof0123456789abcdef")
-    );
-}
-
-/// Non-interactive / CI contexts fail fast on `step_up_required` (no poll wait).
+/// Non-interactive auto mode preflights without creating a challenge.
 #[cargo_test]
 fn step_up_fail_fast_when_noninteractive() {
     let _registry = RegistryBuilder::new()
         .alternative()
         .http_api()
-        .add_responder("/api/v1/crates/new", |req, _server| {
-            let origin = req.url.origin().ascii_serialization();
-            let body = format!(
-                r#"{{"errors":[{{"detail":"Additional authentication is required. Visit {origin}/verify/stp_ci from an interactive session.","id":"step_up_required","protocol_version":1,"challenge_id":"stp_ci","operation":"publish","crate":"foo","poll_url":"{origin}/api/v1/auth/challenges/stp_ci","expires_at":"2099-01-01T00:00:00Z","recommended_poll_interval_secs":1}}]}}"#
-            );
+        .step_up_auth()
+        .add_responder("/api/v1/auth/mutation-challenges", |req, _server| {
+            let descriptor: serde_json::Value =
+                serde_json::from_slice(req.body.as_deref().unwrap()).unwrap();
+            assert_eq!(descriptor["allow_pending"], false);
             Response {
                 code: 403,
-                headers: vec![],
-                body: body.into_bytes(),
+                headers: vec!["Cache-Control: no-store".into()],
+                body: br#"{"status":"interaction_required","protocol_version":1,"detail":"This operation requires registry authorization."}"#.to_vec(),
             }
         })
         .build();
@@ -5463,21 +5220,12 @@ fn step_up_fail_fast_when_noninteractive() {
         .file("src/lib.rs", "")
         .build();
 
-    // No CARGO_STEP_UP_INTERACTIVE / PREFER_LOCALHOST: CI + non-TTY → fail fast.
     p.cargo("publish --no-verify --registry alternative")
         .env("CI", "true")
         .with_status(101)
-        .with_stderr_data(str![[r#"
-[UPDATING] `alternative` index
-[PACKAGING] foo v0.0.1 ([..]foo)
-[PACKAGED] 4 files, [FILE_SIZE]B ([FILE_SIZE]B compressed)
-[UPLOADING] foo v0.0.1 ([..]foo)
-[ERROR] failed to publish foo v0.0.1 to registry at http://127.0.0.1:[..]/
-
-Caused by:
-  additional authentication is required but Cargo is running non-interactively; Instructions from registry http://127.0.0.1:[..]:
-  Additional authentication is required. Visit http://127.0.0.1:[..]/verify/stp_ci from an interactive session.
-
-"#]])
+        .with_stderr_contains("[..]This operation requires registry authorization.[..]")
+        .with_stderr_contains(
+            "[..]no authorization challenge was created; rerun with --registry-authorization=poll[..]",
+        )
         .run();
 }

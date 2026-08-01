@@ -54,36 +54,31 @@ pub struct Registry<T: HttpClient> {
     handle: T,
     /// Whether to include the authorization token with all requests.
     auth_required: bool,
-    /// Advertised version of the idempotency-first step-up protocol.
-    step_up_auth_version: Option<u64>,
-    /// Extra headers for interactive step-up (localhost port / proof retry).
-    step_up_headers: StepUpHeaders,
+    /// Selected mutation-authorization protocol version.
+    mutation_authorization_version: Option<u64>,
+    /// Whether the registry advertised a mutation-authorization envelope.
+    mutation_authorization_advertised: bool,
+    /// Operations for which the registry advertised mutation authorization.
+    mutation_authorization_operations: Vec<String>,
+    /// Extra headers for the final idempotent mutation request.
+    mutation_headers: MutationHeaders,
     /// Optional bound for API response bodies while recognizing a reactive challenge.
     response_body_limit: Option<usize>,
 }
 
-/// Optional headers for the registry interactive step-up handshake.
-///
-/// When `port` is set, Cargo listens on `127.0.0.1:{port}` for a one-shot proof
-/// from the registry verify page (`Cargo-Step-Up-Port`). `callback_secret`
-/// authorizes callback port refreshes and is returned as listener callback
-/// state. Callback challenges remain pollable through an exact scoped grant.
-/// When the callback wins, the proof is sent on retry as `Cargo-Step-Up-Proof`.
+/// Optional headers for an idempotent registry mutation.
 #[derive(Clone, Default)]
-pub struct StepUpHeaders {
-    pub port: Option<u16>,
-    pub callback_secret: Option<String>,
-    pub proof: Option<String>,
+pub struct MutationHeaders {
     pub mutation_id: Option<String>,
 }
 
 /// Exact mutation descriptor sent before an idempotency-first registry mutation.
 #[derive(Debug, Clone, Serialize)]
 pub struct MutationDescriptor {
-    protocol_version: u64,
     operation: String,
     method: String,
-    endpoint: String,
+    request_target: String,
+    content_type: Option<String>,
     #[serde(rename = "crate")]
     crate_name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -109,10 +104,14 @@ impl MutationDescriptor {
         request_body: &[u8],
     ) -> Self {
         Self {
-            protocol_version: 1,
             operation: operation.to_owned(),
             method: method.as_str().to_owned(),
-            endpoint,
+            request_target: endpoint,
+            content_type: if request_body.is_empty() {
+                None
+            } else {
+                Some("application/json".to_owned())
+            },
             crate_name: crate_name.to_owned(),
             version: None,
             request_sha256: hex::encode(Sha256::digest(request_body)),
@@ -138,6 +137,7 @@ impl MutationDescriptor {
             body,
         );
         descriptor.version = Some(version.to_owned());
+        descriptor.content_type = Some("application/octet-stream".to_owned());
         descriptor.archive_sha256 = Some(hex::encode(Sha256::digest(&body[archive_start..])));
         descriptor.archive_size = Some(archive_size);
         descriptor
@@ -164,7 +164,7 @@ impl MutationDescriptor {
         let body = serde_json::to_vec(&OwnersReq { users: owners })?;
         let method = if add { Method::PUT } else { Method::DELETE };
         let mut descriptor = Self::base(
-            "change-owners",
+            "owners",
             method,
             format!("/api/v1/crates/{crate_name}/owners"),
             crate_name,
@@ -174,17 +174,57 @@ impl MutationDescriptor {
         descriptor.owners = Some(owners.iter().map(|owner| (*owner).to_owned()).collect());
         Ok(descriptor)
     }
+
+    /// Registry operation name used for capability selection.
+    pub fn operation(&self) -> &str {
+        &self.operation
+    }
 }
 
-/// A mutation record returned by a successful preflight.
+/// Optional loopback callback delivery requested during preflight.
+#[derive(Debug, Clone, Serialize)]
+pub struct MutationCallback {
+    /// Exact listener URL registered for this logical invocation.
+    pub url: String,
+}
+
+/// Versioned preflight request for an exact registry mutation.
+#[derive(Debug, Serialize)]
+struct MutationPreflight<'a> {
+    protocol_version: u64,
+    preflight_id: &'a str,
+    allow_pending: bool,
+    #[serde(flatten)]
+    descriptor: &'a MutationDescriptor,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    callback: Option<&'a MutationCallback>,
+}
+
+/// Registry response to a mutation preflight.
 #[derive(Debug, Clone, Deserialize)]
-pub struct StepUpReady {
-    /// Must be `acknowledged` before Cargo sends the mutation.
+pub struct MutationAuthorizationResponse {
     pub status: String,
-    /// Canonical mutation ID to send on the final request and retries.
-    pub challenge_id: String,
-    /// End of the mutation record's advertised replay lifetime.
-    pub expires_at: Option<String>,
+    pub protocol_version: u64,
+    #[serde(default)]
+    pub mutation_id: Option<String>,
+    #[serde(default)]
+    pub detail: Option<String>,
+    #[serde(default)]
+    pub operation: Option<String>,
+    #[serde(default, rename = "crate")]
+    pub crate_name: Option<String>,
+    #[serde(default)]
+    pub operation_summary: Option<String>,
+    #[serde(default)]
+    pub verification_url: Option<String>,
+    #[serde(default)]
+    pub poll_url: Option<String>,
+    #[serde(default)]
+    pub challenge_expires_in: Option<u64>,
+    #[serde(default)]
+    pub grant_expires_in: Option<u64>,
+    #[serde(default)]
+    pub recommended_poll_interval_secs: Option<u64>,
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -275,50 +315,21 @@ struct OwnerResponse {
 struct ApiErrorList {
     errors: Vec<ApiError>,
 }
-#[derive(Default, Deserialize)]
+#[derive(Deserialize)]
 struct ApiError {
     detail: String,
-    #[serde(default)]
-    id: Option<String>,
-    #[serde(default)]
-    protocol_version: Option<u64>,
-    #[serde(default)]
-    poll_url: Option<String>,
-    #[serde(default)]
-    recommended_poll_interval_secs: Option<u64>,
-    #[serde(default)]
-    expires_at: Option<String>,
-    #[serde(default)]
-    challenge_id: Option<String>,
-    #[serde(default)]
-    operation: Option<String>,
-    #[serde(default, rename = "crate")]
-    crate_name: Option<String>,
 }
 
-/// Registry response when a dangerous API call needs an interactive step-up challenge.
-///
-/// See the crates.io step-up handshake (`errors[].id == "step_up_required"`).
-#[derive(Debug, Clone)]
-pub struct StepUpRequired {
-    pub detail: String,
-    /// Canonical mutation id returned by preflight.
-    pub challenge_id: String,
-    /// Version of the step-up wire contract.
-    pub protocol_version: u64,
-    pub operation: Option<String>,
-    pub crate_name: Option<String>,
-    pub poll_url: String,
-    pub recommended_poll_interval_secs: Option<u64>,
-    pub expires_at: Option<String>,
-}
-
-/// Poll response body for `GET` of [`StepUpRequired::poll_url`].
+/// Poll response body for a mutation-authorization status URL.
 #[derive(Debug, Deserialize)]
-pub struct StepUpChallengeStatus {
+pub struct MutationAuthorizationStatus {
     pub status: String,
     #[serde(default)]
-    pub acknowledged: bool,
+    pub detail: Option<String>,
+    #[serde(default)]
+    pub challenge_expires_in: Option<u64>,
+    #[serde(default)]
+    pub grant_expires_in: Option<u64>,
     #[serde(default)]
     pub recommended_poll_interval_secs: Option<u64>,
 }
@@ -376,15 +387,6 @@ pub enum Error<T> {
         headers: Vec<String>,
         errors: Vec<String>,
     },
-
-    /// Registry requires interactive step-up (e.g. crates.io passkey).
-    ///
-    /// The CLI should print [`StepUpRequired::detail`], complete the handshake
-    /// via a localhost proof (preferred) or by polling
-    /// [`StepUpRequired::poll_url`], then retry the request (with
-    /// `Cargo-Step-Up-Proof` when using the callback path).
-    #[error("{}", .0.detail)]
-    StepUpRequired(StepUpRequired),
 
     /// `poll_url` from a step-up challenge did not share the registry API origin.
     ///
@@ -473,34 +475,57 @@ impl<T: HttpClient> Registry<T> {
             token,
             handle,
             auth_required,
-            step_up_auth_version: None,
-            step_up_headers: StepUpHeaders::default(),
+            mutation_authorization_version: None,
+            mutation_authorization_advertised: false,
+            mutation_authorization_operations: Vec::new(),
+            mutation_headers: MutationHeaders::default(),
             response_body_limit: None,
         }
     }
 
-    /// Sets the step-up protocol version advertised by registry `config.json`.
-    pub fn set_step_up_auth_version(&mut self, version: Option<u64>) {
-        self.step_up_auth_version = version;
+    /// Sets mutation-authorization capabilities advertised by registry `config.json`.
+    pub fn set_mutation_authorization(
+        &mut self,
+        versions: impl IntoIterator<Item = u64>,
+        operations: Vec<String>,
+    ) {
+        self.mutation_authorization_advertised = true;
+        self.mutation_authorization_version =
+            versions.into_iter().filter(|version| *version == 1).max();
+        self.mutation_authorization_operations = operations;
     }
 
-    /// Whether this registry advertises idempotency-first step-up version 1.
-    pub fn supports_step_up_preflight(&self) -> bool {
-        self.step_up_auth_version == Some(1)
+    /// Whether this registry advertises version 1 for `operation`.
+    pub fn supports_mutation_authorization(&self, operation: &str) -> bool {
+        self.mutation_authorization_version == Some(1)
+            && self
+                .mutation_authorization_operations
+                .iter()
+                .any(|advertised| advertised == operation)
+    }
+
+    /// Whether `operation` is advertised but has no version supported by Cargo.
+    pub fn mutation_authorization_version_unsupported(&self, operation: &str) -> bool {
+        self.mutation_authorization_advertised
+            && self.mutation_authorization_version.is_none()
+            && self
+                .mutation_authorization_operations
+                .iter()
+                .any(|advertised| advertised == operation)
     }
 
     pub fn set_token(&mut self, token: Option<String>) {
         self.token = token;
     }
 
-    /// Sets step-up headers applied to subsequent mutating API requests.
-    pub fn set_step_up_headers(&mut self, headers: StepUpHeaders) {
-        self.step_up_headers = headers;
+    /// Sets headers applied to the final idempotent mutation request.
+    pub fn set_mutation_headers(&mut self, headers: MutationHeaders) {
+        self.mutation_headers = headers;
     }
 
     /// Clears step-up headers after a successful mutate or when abandoning a handshake.
-    pub fn clear_step_up_headers(&mut self) {
-        self.step_up_headers = StepUpHeaders::default();
+    pub fn clear_mutation_headers(&mut self) {
+        self.mutation_headers = MutationHeaders::default();
     }
 
     /// Bounds subsequent API response bodies, including while they are received by Cargo.
@@ -512,16 +537,80 @@ impl<T: HttpClient> Registry<T> {
     pub fn preflight_mutation(
         &mut self,
         descriptor: &MutationDescriptor,
-    ) -> RegistryResult<StepUpReady, T::Error> {
-        let body = serde_json::to_vec(descriptor)?;
-        let response = self.req_with_response_body_limit(
-            Method::POST,
-            "/auth/challenges",
-            Some(&body),
-            Auth::Authorized,
-            STEP_UP_RESPONSE_MAX_BYTES,
-        )?;
-        Ok(serde_json::from_str(&response)?)
+        preflight_id: &str,
+        allow_pending: bool,
+        callback: Option<&MutationCallback>,
+    ) -> RegistryResult<(StatusCode, MutationAuthorizationResponse), T::Error> {
+        let mut descriptor = descriptor.clone();
+        let endpoint = descriptor
+            .request_target
+            .strip_prefix("/api/v1")
+            .ok_or_else(|| {
+                Error::InvalidStepUpChallenge(
+                    "mutation request_target did not use the registry API path".to_owned(),
+                )
+            })?;
+        descriptor.request_target = Url::parse(&self.api_url(endpoint))
+            .map_err(|error| Error::InvalidStepUpChallenge(error.to_string()))?
+            .path()
+            .to_owned();
+        let body = serde_json::to_vec(&MutationPreflight {
+            protocol_version: 1,
+            preflight_id,
+            allow_pending,
+            descriptor: &descriptor,
+            callback,
+        })?;
+        let mut request = http::Request::builder()
+            .method(Method::POST)
+            .uri(self.api_url("/auth/mutation-challenges"))
+            .header(http::header::ACCEPT, "application/json")
+            .header(http::header::CONTENT_TYPE, "application/json")
+            .header(http::header::AUTHORIZATION, self.token()?);
+        request = request.header(http::header::CONTENT_LENGTH, body.len());
+        let mut request = request.body(body)?;
+        request
+            .extensions_mut()
+            .insert(ResponseBodyLimit(STEP_UP_RESPONSE_MAX_BYTES));
+        let response = self
+            .handle
+            .request_no_redirect(request)
+            .map_err(Error::Transport)?;
+        if response.body().len() > STEP_UP_RESPONSE_MAX_BYTES {
+            return Err(Error::StepUpResponseTooLarge {
+                limit: STEP_UP_RESPONSE_MAX_BYTES,
+            });
+        }
+        if response.status().is_redirection() {
+            let location = response
+                .headers()
+                .get(http::header::LOCATION)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned);
+            return Err(Error::InvalidStepUpPollRedirect {
+                poll_url: self.api_url("/auth/mutation-challenges"),
+                location,
+            });
+        }
+        if !has_no_store(response.headers()) {
+            return Err(Error::InvalidStepUpChallenge(
+                "preflight response must include Cache-Control: no-store".to_owned(),
+            ));
+        }
+        let status = response.status();
+        if !matches!(
+            status,
+            StatusCode::OK | StatusCode::ACCEPTED | StatusCode::FORBIDDEN
+        ) {
+            return self.handle(response).and_then(|_| {
+                Err(Error::InvalidStepUpChallenge(
+                    "preflight returned an invalid HTTP status".to_owned(),
+                ))
+            });
+        }
+        let body = String::from_utf8(response.into_body())?;
+        let response = serde_json::from_str(&body)?;
+        Ok((status, response))
     }
 
     fn token(&self) -> RegistryResult<&str, T::Error> {
@@ -601,9 +690,10 @@ impl<T: HttpClient> Registry<T> {
         let url = self.api_url("/crates/new");
 
         let request = self
-            .apply_step_up_headers(
+            .apply_mutation_headers(
                 http::Request::put(url)
                     .header(http::header::CONTENT_TYPE, "application/octet-stream")
+                    .header(http::header::CONTENT_LENGTH, body.len())
                     .header(http::header::ACCEPT, "application/json")
                     .header(http::header::AUTHORIZATION, self.token()?),
             )
@@ -697,10 +787,10 @@ impl<T: HttpClient> Registry<T> {
     ///
     /// `poll_url` must share scheme/host/port with [`Registry::host`]. Redirects
     /// are not followed.
-    pub fn poll_step_up_challenge(
+    pub fn poll_mutation_authorization(
         &mut self,
         poll_url: &str,
-    ) -> RegistryResult<StepUpChallengeStatus, T::Error> {
+    ) -> RegistryResult<MutationAuthorizationStatus, T::Error> {
         if !url_shares_origin_with_registry(poll_url, &self.host) {
             return Err(Error::InvalidStepUpPollUrl {
                 poll_url: poll_url.to_owned(),
@@ -738,6 +828,11 @@ impl<T: HttpClient> Registry<T> {
                 location,
             });
         }
+        if !has_no_store(response.headers()) {
+            return Err(Error::InvalidStepUpChallenge(
+                "poll response must include Cache-Control: no-store".to_owned(),
+            ));
+        }
 
         let body = self.handle(response)?;
         Ok(serde_json::from_str(&body)?)
@@ -762,7 +857,7 @@ impl<T: HttpClient> Registry<T> {
         if let Some(file_url) = host.strip_prefix("file:///") {
             format!("file://localhost/{file_url}/api/v1{path}")
         } else {
-            format!("{host}/api/v1{path}")
+            format!("{}/api/v1{path}", host.trim_end_matches('/'))
         }
     }
 
@@ -774,17 +869,6 @@ impl<T: HttpClient> Registry<T> {
         authorized: Auth,
     ) -> RegistryResult<String, T::Error> {
         self.req_inner(method, path, body, authorized, self.response_body_limit)
-    }
-
-    fn req_with_response_body_limit(
-        &mut self,
-        method: Method,
-        path: &str,
-        body: Option<&[u8]>,
-        authorized: Auth,
-        response_body_limit: usize,
-    ) -> RegistryResult<String, T::Error> {
-        self.req_inner(method, path, body, authorized, Some(response_body_limit))
     }
 
     fn req_inner(
@@ -803,10 +887,11 @@ impl<T: HttpClient> Registry<T> {
         if body.is_some() {
             request = request.header(http::header::CONTENT_TYPE, "application/json");
         }
+        request = request.header(http::header::CONTENT_LENGTH, body.map_or(0, <[u8]>::len));
 
         if self.auth_required || authorized == Auth::Authorized {
             request = request.header(http::header::AUTHORIZATION, self.token()?);
-            request = self.apply_step_up_headers(request);
+            request = self.apply_mutation_headers(request);
         }
         let mut request = request.body(body.unwrap_or_default().to_vec())?;
         if let Some(limit) = response_body_limit {
@@ -821,17 +906,11 @@ impl<T: HttpClient> Registry<T> {
         self.handle(response)
     }
 
-    fn apply_step_up_headers(&self, mut request: http::request::Builder) -> http::request::Builder {
-        if let Some(port) = self.step_up_headers.port {
-            request = request.header("Cargo-Step-Up-Port", port.to_string());
-        }
-        if let Some(secret) = self.step_up_headers.callback_secret.as_deref() {
-            request = request.header("Cargo-Step-Up-Callback-Secret", secret);
-        }
-        if let Some(proof) = self.step_up_headers.proof.as_deref() {
-            request = request.header("Cargo-Step-Up-Proof", proof);
-        }
-        if let Some(mutation_id) = self.step_up_headers.mutation_id.as_deref() {
+    fn apply_mutation_headers(
+        &self,
+        mut request: http::request::Builder,
+    ) -> http::request::Builder {
+        if let Some(mutation_id) = self.mutation_headers.mutation_id.as_deref() {
             request = request.header("Cargo-Mutation-Id", mutation_id);
         }
         request
@@ -839,7 +918,7 @@ impl<T: HttpClient> Registry<T> {
 
     fn handle(&mut self, response: http::Response<Vec<u8>>) -> RegistryResult<String, T::Error> {
         let (head, body) = response.into_parts();
-        let body = redact_step_up_credentials(String::from_utf8(body)?, &self.step_up_headers);
+        let body = String::from_utf8(body)?;
         let api_errors = serde_json::from_str::<ApiErrorList>(&body).ok();
 
         let headers = head
@@ -847,22 +926,7 @@ impl<T: HttpClient> Registry<T> {
             .iter()
             .filter_map(|(k, v)| Some((k, v.to_str().ok()?)))
             .map(|(k, v)| format!("{k}: {v}"))
-            .map(|line| redact_step_up_credentials(line, &self.step_up_headers))
             .collect();
-
-        // Only treat step-up challenges from error bodies. crates.io historically
-        // returns `200 OK` for cargo endpoints even on failures (`cargo_compat`
-        // AdjustAll), so do not gate on HTTP status — look for the structured
-        // `step_up_required` error object whenever the body parses as an error list.
-        if let Some(list) = &api_errors {
-            for error in &list.errors {
-                if let Some(step_up) =
-                    step_up_required_from_api_error(error).map_err(Error::InvalidStepUpChallenge)?
-                {
-                    return Err(Error::StepUpRequired(step_up));
-                }
-            }
-        }
 
         let errors = api_errors.map(|s| s.errors.into_iter().map(|s| s.detail).collect::<Vec<_>>());
 
@@ -882,49 +946,6 @@ impl<T: HttpClient> Registry<T> {
     }
 }
 
-/// Removes client-held step-up credentials from a response before parsing,
-/// displaying, or including it in an error.
-fn redact_step_up_credentials(mut body: String, headers: &StepUpHeaders) -> String {
-    for credential in [headers.callback_secret.as_deref(), headers.proof.as_deref()]
-        .into_iter()
-        .flatten()
-        .filter(|credential| !credential.is_empty())
-    {
-        body = body.replace(credential, "[REDACTED]");
-    }
-    body
-}
-
-fn step_up_required_from_api_error(err: &ApiError) -> Result<Option<StepUpRequired>, String> {
-    if err.id.as_deref() != Some("step_up_required") || err.protocol_version != Some(1) {
-        return Ok(None);
-    }
-    if err.detail.is_empty() {
-        return Err("`detail` must not be empty".to_owned());
-    }
-    if err.detail.len() > STEP_UP_DETAIL_MAX_BYTES {
-        return Err(format!(
-            "`detail` exceeds the {STEP_UP_DETAIL_MAX_BYTES}-byte limit"
-        ));
-    }
-    let Some(poll_url) = err.poll_url.clone() else {
-        return Ok(None);
-    };
-    let Some(challenge_id) = err.challenge_id.clone() else {
-        return Ok(None);
-    };
-    Ok(Some(StepUpRequired {
-        detail: err.detail.clone(),
-        challenge_id,
-        protocol_version: 1,
-        operation: err.operation.clone(),
-        crate_name: err.crate_name.clone(),
-        poll_url,
-        recommended_poll_interval_secs: err.recommended_poll_interval_secs,
-        expires_at: err.expires_at.clone(),
-    }))
-}
-
 /// Returns true when `url` shares scheme, host, and port with `registry_host`.
 pub fn url_shares_origin_with_registry(url: &str, registry_host: &str) -> bool {
     let Ok(url) = Url::parse(url) else {
@@ -936,6 +957,15 @@ pub fn url_shares_origin_with_registry(url: &str, registry_host: &str) -> bool {
     url.scheme() == host.scheme()
         && url.host() == host.host()
         && url.port_or_known_default() == host.port_or_known_default()
+}
+
+fn has_no_store(headers: &http::HeaderMap) -> bool {
+    headers
+        .get_all(http::header::CACHE_CONTROL)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .any(|directive| directive.trim().eq_ignore_ascii_case("no-store"))
 }
 
 fn status(code: StatusCode) -> String {
@@ -992,11 +1022,42 @@ pub fn check_token(token: &str) -> Result<(), TokenError> {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
     use super::{
-        ApiError, MutationDescriptor, StepUpHeaders, redact_step_up_credentials,
-        step_up_required_from_api_error, url_shares_origin_with_registry,
+        HttpClient, MutationDescriptor, Registry, url_shares_origin_with_registry,
     };
+    use http::{Request, Response};
     use sha2::{Digest, Sha256};
+
+    #[derive(Clone)]
+    struct RecordingClient(Rc<RefCell<Option<Request<Vec<u8>>>>>);
+
+    impl HttpClient for RecordingClient {
+        type Error = std::io::Error;
+
+        fn request(
+            &self,
+            _request: Request<Vec<u8>>,
+        ) -> Result<Response<Vec<u8>>, Self::Error> {
+            unreachable!()
+        }
+
+        fn request_no_redirect(
+            &self,
+            request: Request<Vec<u8>>,
+        ) -> Result<Response<Vec<u8>>, Self::Error> {
+            *self.0.borrow_mut() = Some(request);
+            Ok(Response::builder()
+                .header("Cache-Control", "no-store")
+                .body(
+                    br#"{"status":"ready","protocol_version":1,"mutation_id":"mut_0123456789abcdefghijkl","grant_expires_in":300}"#
+                        .to_vec(),
+                )
+                .unwrap())
+        }
+    }
 
     #[test]
     fn step_up_poll_url_same_origin() {
@@ -1031,90 +1092,6 @@ mod tests {
     }
 
     #[test]
-    fn step_up_required_parses_version_one_contract() {
-        let error = valid_step_up_error();
-        let step_up = step_up_required_from_api_error(&error).unwrap().unwrap();
-        assert_eq!(step_up.protocol_version, 1);
-        assert_eq!(step_up.detail, "Additional authentication is required");
-        assert_eq!(
-            step_up.poll_url,
-            "https://crates.io/api/v1/auth/challenges/stp_x"
-        );
-    }
-
-    #[test]
-    fn step_up_required_rejects_incomplete_or_unknown_contracts() {
-        let mut missing_version = valid_step_up_error();
-        missing_version.protocol_version = None;
-        assert!(
-            step_up_required_from_api_error(&missing_version)
-                .unwrap()
-                .is_none()
-        );
-
-        let mut unknown_version = valid_step_up_error();
-        unknown_version.protocol_version = Some(2);
-        assert!(
-            step_up_required_from_api_error(&unknown_version)
-                .unwrap()
-                .is_none()
-        );
-
-        let mut missing_poll_url = valid_step_up_error();
-        missing_poll_url.poll_url = None;
-        assert!(
-            step_up_required_from_api_error(&missing_poll_url)
-                .unwrap()
-                .is_none()
-        );
-
-        let mut missing_challenge_id = valid_step_up_error();
-        missing_challenge_id.challenge_id = None;
-        assert!(
-            step_up_required_from_api_error(&missing_challenge_id)
-                .unwrap()
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn step_up_required_rejects_oversized_detail() {
-        let mut error = valid_step_up_error();
-        error.detail = "x".repeat(super::STEP_UP_DETAIL_MAX_BYTES + 1);
-
-        assert_eq!(
-            step_up_required_from_api_error(&error).unwrap_err(),
-            "`detail` exceeds the 8192-byte limit"
-        );
-    }
-
-    fn valid_step_up_error() -> ApiError {
-        ApiError {
-            detail: "Additional authentication is required".into(),
-            id: Some("step_up_required".into()),
-            protocol_version: Some(1),
-            challenge_id: Some("stp_x".into()),
-            poll_url: Some("https://crates.io/api/v1/auth/challenges/stp_x".into()),
-            ..ApiError::default()
-        }
-    }
-
-    #[test]
-    fn step_up_credentials_are_redacted_from_registry_responses() {
-        let headers = StepUpHeaders {
-            callback_secret: Some("callback-secret".into()),
-            proof: Some("one-time-proof".into()),
-            ..StepUpHeaders::default()
-        };
-        let body = "callback-secret and one-time-proof".to_owned();
-
-        assert_eq!(
-            redact_step_up_credentials(body, &headers),
-            "[REDACTED] and [REDACTED]"
-        );
-    }
-
-    #[test]
     fn publish_descriptor_hashes_exact_body_and_archive() {
         let mut body = b"metadata-prefix".to_vec();
         body.extend_from_slice(b"archive");
@@ -1146,6 +1123,41 @@ mod tests {
         assert_eq!(
             descriptor["request_sha256"],
             hex::encode(Sha256::digest(body))
+        );
+    }
+
+    #[test]
+    fn preflight_preserves_the_registry_api_path_prefix() {
+        let request = Rc::new(RefCell::new(None));
+        let client = RecordingClient(request.clone());
+        let mut registry = Registry::new_handle(
+            "https://registry.example/tenant".into(),
+            Some("token".into()),
+            client,
+            true,
+        );
+        let descriptor = MutationDescriptor::yank("demo", "1.2.3", false);
+
+        registry
+            .preflight_mutation(
+                &descriptor,
+                "pf_0123456789abcdefghijkl",
+                false,
+                None,
+            )
+            .unwrap();
+
+        let request = request.borrow();
+        let request = request.as_ref().unwrap();
+        assert_eq!(
+            request.uri().path(),
+            "/tenant/api/v1/auth/mutation-challenges"
+        );
+        let body: serde_json::Value =
+            serde_json::from_slice(request.body()).unwrap();
+        assert_eq!(
+            body["request_target"],
+            "/tenant/api/v1/crates/demo/1.2.3/yank"
         );
     }
 }

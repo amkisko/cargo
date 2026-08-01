@@ -20,17 +20,47 @@
       "type": "boolean",
       "default": false
     },
-    "step-up-auth": {
-      "description": "Version of the registry step-up authentication protocol.\n\nRegistries advertise this only after both mutation preflight and\nidempotent mutation requests are supported.",
-      "type": [
-        "integer",
-        "null"
-      ],
-      "format": "uint64",
-      "minimum": 0
+    "mutation-authorization": {
+      "description": "Supported versions and operations for registry mutation authorization.\n\nRegistries advertise an operation only after both mutation preflight and\nidempotent final requests implement the selected protocol version.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/MutationAuthorization"
+        },
+        {
+          "type": "null"
+        }
+      ]
     }
   },
   "required": [
     "dl"
-  ]
+  ],
+  "$defs": {
+    "MutationAuthorization": {
+      "description": "Registry mutation-authorization capabilities advertised by `config.json`.",
+      "type": "object",
+      "properties": {
+        "versions": {
+          "description": "Protocol versions supported by the registry.",
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0
+          }
+        },
+        "operations": {
+          "description": "Ordinary registry mutations protected by the protocol.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "versions",
+        "operations"
+      ]
+    }
+  }
 }

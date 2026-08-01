@@ -21,6 +21,7 @@ pub fn yank(
     version: Option<String>,
     token: Option<Secret<String>>,
     reg_or_index: Option<RegistryOrIndex>,
+    registry_authorization: Option<String>,
     undo: bool,
 ) -> CargoResult<()> {
     let name = match krate {
@@ -60,9 +61,14 @@ pub fn yank(
     if undo {
         gctx.shell().status("Unyank", package_spec)?;
         let descriptor = crates_io::MutationDescriptor::yank(&name, &version, true);
-        super::step_up::with_step_up_retry(gctx, &mut registry, descriptor, |registry| {
-            registry.unyank(&name, &version)
-        })
+        super::step_up::with_step_up_retry(
+            gctx,
+            &mut registry,
+            reg_or_index.as_ref(),
+            registry_authorization.as_deref(),
+            descriptor,
+            |registry| registry.unyank(&name, &version),
+        )
         .with_context(|| {
             format!(
                 "failed to undo a yank from the registry at {}",
@@ -72,9 +78,14 @@ pub fn yank(
     } else {
         gctx.shell().status("Yank", package_spec)?;
         let descriptor = crates_io::MutationDescriptor::yank(&name, &version, false);
-        super::step_up::with_step_up_retry(gctx, &mut registry, descriptor, |registry| {
-            registry.yank(&name, &version)
-        })
+        super::step_up::with_step_up_retry(
+            gctx,
+            &mut registry,
+            reg_or_index.as_ref(),
+            registry_authorization.as_deref(),
+            descriptor,
+            |registry| registry.yank(&name, &version),
+        )
         .with_context(|| format!("failed to yank from the registry at {}", registry.host()))?;
     }
 
