@@ -25,10 +25,7 @@ pub(super) fn transient_poll_delay(
 ) -> Duration {
     let remaining = deadline.saturating_duration_since(Instant::now());
     if let Some(retry_after) = retry_after {
-        return retry_after
-            .max(MIN_POLL_INTERVAL)
-            .min(MAX_POLL_INTERVAL)
-            .min(remaining);
+        return retry_after.max(MIN_POLL_INTERVAL).min(remaining);
     }
 
     let maximum = (previous * 2).min(MAX_POLL_INTERVAL);

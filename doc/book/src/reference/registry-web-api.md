@@ -68,7 +68,7 @@ under `--quiet`.
 Cargo polls without its primary credential. Poll status is `pending`, `ready`,
 `denied`, or `expired`. When `loopback-callback` is activated, Cargo registers
 a loopback URL containing client-generated `state`. Loading that URL causes an
-immediate poll; it is never proof of authorization. Human-readable verification
+immediate poll; it never carries mutation authority. Human-readable verification
 instructions remain entirely in `detail`.
 
 After `ready`, Cargo obtains an ordinary primary credential and sends the

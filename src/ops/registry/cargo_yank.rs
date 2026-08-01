@@ -68,6 +68,7 @@ pub fn yank(
             reg_or_index.as_ref(),
             registry_authorization.as_deref(),
             descriptor,
+            token.is_none(),
             || {
                 auth::auth_token(
                     gctx,
@@ -98,6 +99,7 @@ pub fn yank(
             reg_or_index.as_ref(),
             registry_authorization.as_deref(),
             descriptor,
+            token.is_none(),
             || {
                 auth::auth_token(
                     gctx,

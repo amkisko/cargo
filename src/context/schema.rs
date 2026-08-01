@@ -535,6 +535,8 @@ pub struct RegistryConfig {
     pub secret_key_subject: Option<String>,
     /// Minimum publish age threshold for RFC 3923
     pub min_publish_age: Option<String>,
+    #[serde(rename = "mutation-authorization-channel")]
+    _mutation_authorization_channel: Option<String>,
     #[serde(rename = "protocol")]
     _protocol: Option<String>,
 }
@@ -555,6 +557,8 @@ pub struct GlobalRegistryConfig {
     pub min_publish_age: Option<String>,
     /// Global default Minimum publish age threshold for RFC 3923
     pub global_min_publish_age: Option<String>,
+    #[serde(rename = "mutation-authorization-channel")]
+    _mutation_authorization_channel: Option<String>,
     #[serde(rename = "default")]
     _default: Option<String>,
     #[serde(rename = "global-credential-providers")]
@@ -570,6 +574,7 @@ impl GlobalRegistryConfig {
             secret_key: self.secret_key,
             secret_key_subject: self.secret_key_subject,
             min_publish_age: self.min_publish_age,
+            _mutation_authorization_channel: self._mutation_authorization_channel,
             _protocol: None,
         }
     }

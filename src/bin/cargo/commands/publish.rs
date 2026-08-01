@@ -12,7 +12,7 @@ pub fn cli() -> Command {
         .arg_registry("Registry to upload the package to")
         .arg(
             opt(
-                "registry-authorization",
+                "mutation-authorization-channel",
                 "Select registry mutation authorization channel",
             )
             .value_name("CHANNEL")
@@ -70,7 +70,9 @@ pub fn exec(gctx: &mut GlobalContext, args: &ArgMatches) -> CliResult {
             gctx,
             token,
             reg_or_index,
-            registry_authorization: args.get_one::<String>("registry-authorization").cloned(),
+            registry_authorization: args
+                .get_one::<String>("mutation-authorization-channel")
+                .cloned(),
             verify: !args.flag("no-verify"),
             allow_dirty: args.flag("allow-dirty"),
             to_publish: args.packages_from_flags()?,

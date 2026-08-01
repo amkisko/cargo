@@ -56,6 +56,7 @@ pub fn modify_owners(gctx: &GlobalContext, opts: &OwnersOptions) -> CargoResult<
             opts.reg_or_index.as_ref(),
             opts.registry_authorization.as_deref(),
             descriptor,
+            opts.token.is_none(),
             || {
                 auth::auth_token(
                     gctx,
@@ -90,6 +91,7 @@ pub fn modify_owners(gctx: &GlobalContext, opts: &OwnersOptions) -> CargoResult<
             opts.reg_or_index.as_ref(),
             opts.registry_authorization.as_deref(),
             descriptor,
+            opts.token.is_none(),
             || {
                 auth::auth_token(
                     gctx,

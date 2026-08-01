@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::prelude::*;
 use cargo_test_support::git::{self, repo};
-use cargo_test_support::registry::{self, Package, RegistryBuilder, Response};
+use cargo_test_support::registry::{self, Package, RegistryBuilder, Response, cksum};
 use cargo_test_support::{Project, paths};
 use cargo_test_support::{basic_manifest, project, publish, str};
 
@@ -4978,7 +4978,7 @@ fn mutation_authorization_404_rejects_explicit_loopback() {
 
     mutation_authorization_publish_project()
         .cargo("publish --no-verify --registry alternative")
-        .arg("--registry-authorization=loopback")
+        .arg("--mutation-authorization-channel=loopback")
         .with_status(101)
         .with_stderr_contains("[..]cannot activate the `loopback-callback` extension[..]")
         .run();
@@ -5055,8 +5055,11 @@ fn mutation_authorization_malformed_response_fails_closed() {
 fn mutation_authorization_preflight_uploads_publish_body_once() {
     let preflight_count = Arc::new(Mutex::new(0u32));
     let publish_count = Arc::new(Mutex::new(0u32));
+    let descriptor_hashes = Arc::new(Mutex::new(None));
     let preflight_count2 = preflight_count.clone();
     let publish_count2 = publish_count.clone();
+    let preflight_descriptor_hashes = descriptor_hashes.clone();
+    let publish_descriptor_hashes = descriptor_hashes.clone();
 
     let _registry = RegistryBuilder::new()
         .alternative()
@@ -5082,6 +5085,12 @@ fn mutation_authorization_preflight_uploads_publish_body_once() {
             assert_eq!(descriptor["version"], "0.0.1");
             assert_eq!(descriptor["request_sha256"].as_str().unwrap().len(), 64);
             assert_eq!(descriptor["archive_sha256"].as_str().unwrap().len(), 64);
+            *preflight_descriptor_hashes.lock().unwrap() = Some((
+                descriptor["request_sha256"].as_str().unwrap().to_owned(),
+                descriptor["request_size"].as_u64().unwrap(),
+                descriptor["archive_sha256"].as_str().unwrap().to_owned(),
+                descriptor["archive_size"].as_u64().unwrap(),
+            ));
             assert!(
                 req.body.as_ref().unwrap().len()
                     < descriptor["archive_size"].as_u64().unwrap() as usize,
@@ -5098,6 +5107,19 @@ fn mutation_authorization_preflight_uploads_publish_body_once() {
             assert_eq!(
                 req.cargo_mutation_id.as_deref(),
                 Some("mut_publish_once_0123456789")
+            );
+            let body = req.body.as_deref().unwrap();
+            let descriptor = publish_descriptor_hashes
+                .lock()
+                .unwrap()
+                .clone()
+                .unwrap();
+            assert_eq!(descriptor.0, cksum(body));
+            assert_eq!(descriptor.1, body.len() as u64);
+            let archive_start = body.len() - descriptor.3 as usize;
+            assert_eq!(
+                descriptor.2,
+                cksum(&body[archive_start..])
             );
             server.check_authorized_publish(req)
         })
@@ -5127,6 +5149,33 @@ fn mutation_authorization_preflight_uploads_publish_body_once() {
 
     assert_eq!(*preflight_count2.lock().unwrap(), 1);
     assert_eq!(*publish_count2.lock().unwrap(), 1);
+}
+
+/// An explicit command-line token remains the primary credential for the whole flow.
+#[cargo_test]
+fn mutation_authorization_preserves_explicit_token() {
+    let _registry = RegistryBuilder::new()
+        .alternative()
+        .http_api()
+        .token(registry::Token::Plaintext("command-token".to_owned()))
+        .add_responder("/api/v1/auth/mutation-challenges", |req, _server| {
+            assert_eq!(req.authorization.as_deref(), Some("command-token"));
+            Response {
+                code: 200,
+                headers: vec!["Cache-Control: no-store".into()],
+                body: br#"{"status":"ready","protocol_version":1,"active_extensions":["idempotent-final"],"mutation_id":"mut_explicit_token_012345678","grant_expires_in":300,"receive_lease_secs":1800}"#.to_vec(),
+            }
+        })
+        .add_responder("/api/v1/crates/new", |req, server| {
+            assert_eq!(req.authorization.as_deref(), Some("command-token"));
+            server.check_authorized_publish(req)
+        })
+        .build();
+
+    mutation_authorization_publish_project()
+        .cargo("publish --no-verify --registry alternative --token command-token")
+        .env("CARGO_REGISTRIES_ALTERNATIVE_TOKEN", "provider-token")
+        .run();
 }
 
 /// Core-only registries do not opt Cargo into retrying an ambiguous final request.
@@ -5204,11 +5253,47 @@ fn mutation_authorization_core_rejects_explicit_loopback() {
         .build();
 
     p.cargo("publish --no-verify --registry alternative")
-        .arg("--registry-authorization=loopback")
+        .arg("--mutation-authorization-channel=loopback")
         .with_status(101)
         .with_stderr_contains(
             "[..]registry did not activate the `loopback-callback` authorization extension[..]",
         )
+        .run();
+}
+
+/// The loopback wake-up listener closes before Cargo sends registry credentials.
+#[cargo_test]
+fn mutation_authorization_closes_loopback_before_final_request() {
+    let callback_url = Arc::new(Mutex::new(None));
+    let preflight_callback_url = callback_url.clone();
+    let final_callback_url = callback_url.clone();
+    let _registry = RegistryBuilder::new()
+        .alternative()
+        .http_api()
+        .add_responder("/api/v1/auth/mutation-challenges", move |req, _server| {
+            let descriptor: serde_json::Value =
+                serde_json::from_slice(req.body.as_deref().unwrap()).unwrap();
+            let url = descriptor["callback"]["url"].as_str().unwrap();
+            *preflight_callback_url.lock().unwrap() = Some(url::Url::parse(url).unwrap());
+            Response {
+                code: 200,
+                headers: vec!["Cache-Control: no-store".into()],
+                body: br#"{"status":"ready","protocol_version":1,"active_extensions":["idempotent-final","loopback-callback"],"mutation_id":"mut_loopback_closed_0123456","grant_expires_in":300,"receive_lease_secs":1800}"#.to_vec(),
+            }
+        })
+        .add_responder("/api/v1/crates/new", move |req, server| {
+            let callback = final_callback_url.lock().unwrap().clone().unwrap();
+            assert!(
+                std::net::TcpStream::connect(("127.0.0.1", callback.port().unwrap())).is_err(),
+                "callback listener remained open during the final mutation"
+            );
+            server.check_authorized_publish(req)
+        })
+        .build();
+
+    mutation_authorization_publish_project()
+        .cargo("publish --no-verify --registry alternative")
+        .arg("--mutation-authorization-channel=loopback")
         .run();
 }
 
@@ -5302,7 +5387,7 @@ fn mutation_authorization_rejects_oversized_poll_response_once() {
         .build();
 
     p.cargo("publish --no-verify --registry alternative")
-        .arg("--registry-authorization=poll")
+        .arg("--mutation-authorization-channel=poll")
         .with_status(101)
         .with_stderr_contains("[..]HTTP response body exceeded the 65536-byte limit[..]")
         .run();
@@ -5402,7 +5487,7 @@ fn mutation_authorization_rejects_poll_redirect() {
         .build();
 
     p.cargo("publish --no-verify --registry alternative")
-        .arg("--registry-authorization=poll")
+        .arg("--mutation-authorization-channel=poll")
         .with_status(101)
         .with_stderr_contains(
             "[..]refusing to follow mutation-authorization poll redirect from [..] to [..][..]",
@@ -5445,7 +5530,7 @@ fn mutation_authorization_rejects_cross_origin_poll_url() {
         .build();
 
     p.cargo("publish --no-verify --registry alternative")
-        .arg("--registry-authorization=poll")
+        .arg("--mutation-authorization-channel=poll")
         .with_status(101)
         .with_stderr_contains(
             "[..]mutation authorization poll_url must share the registry API origin[..]",
@@ -5500,7 +5585,7 @@ fn mutation_authorization_poll_not_found() {
         .build();
 
     p.cargo("publish --no-verify --registry alternative")
-        .arg("--registry-authorization=poll")
+        .arg("--mutation-authorization-channel=poll")
         .with_status(101)
         .with_stderr_contains("[..]mutation authorization record was not found[..]")
         .run();
@@ -5548,7 +5633,7 @@ fn mutation_authorization_fails_fast_when_noninteractive() {
         .with_status(101)
         .with_stderr_contains("[..]This operation requires registry authorization.[..]")
         .with_stderr_contains(
-            "[..]no authorization challenge was created; rerun with --registry-authorization=poll[..]",
+            "[..]no authorization challenge was created; rerun with --mutation-authorization-channel=poll[..]",
         )
         .run();
 }

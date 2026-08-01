@@ -68,6 +68,19 @@ fn zero_retry_after_uses_the_minimum_poll_interval() {
 }
 
 #[test]
+fn retry_after_is_bounded_by_deadline_not_poll_interval_cap() {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    assert_eq!(
+        transient_poll_delay(
+            DEFAULT_POLL_INTERVAL,
+            Some(Duration::from_secs(45)),
+            deadline
+        ),
+        Duration::from_secs(45)
+    );
+}
+
+#[test]
 fn oversized_final_response_is_not_retryable() {
     let error = RegistryError::Transport(http_async::Error::ResponseBodyTooLarge {
         limit: crates_io::MUTATION_RESPONSE_MAX_BYTES,

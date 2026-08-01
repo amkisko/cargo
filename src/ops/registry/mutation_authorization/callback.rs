@@ -98,12 +98,22 @@ fn read_request(stream: TcpStream, expected_state: &str) -> Option<()> {
     stream.set_read_timeout(Some(IO_TIMEOUT)).ok()?;
     stream.set_write_timeout(Some(IO_TIMEOUT)).ok()?;
     let mut reader = BufReader::new(stream);
-    let request_line = read_bounded_line(&mut reader, MAX_REQUEST_LINE_BYTES)?;
+    let Some(request_line) = read_bounded_line(&mut reader, MAX_REQUEST_LINE_BYTES) else {
+        let _ = write_response(reader.get_ref(), 400, "invalid request");
+        return None;
+    };
 
     let mut header_bytes = 0;
     loop {
-        let remaining = MAX_HEADER_BYTES.checked_sub(header_bytes)?;
-        let line = read_bounded_line(&mut reader, remaining.min(MAX_HEADER_LINE_BYTES))?;
+        let Some(remaining) = MAX_HEADER_BYTES.checked_sub(header_bytes) else {
+            let _ = write_response(reader.get_ref(), 400, "invalid request");
+            return None;
+        };
+        let Some(line) = read_bounded_line(&mut reader, remaining.min(MAX_HEADER_LINE_BYTES))
+        else {
+            let _ = write_response(reader.get_ref(), 400, "invalid request");
+            return None;
+        };
         header_bytes += line.len();
         if line == b"\r\n" || line == b"\n" {
             break;
@@ -111,27 +121,45 @@ fn read_request(stream: TcpStream, expected_state: &str) -> Option<()> {
     }
     let stream = reader.into_inner();
 
-    let request_line = std::str::from_utf8(&request_line).ok()?;
+    let Ok(request_line) = std::str::from_utf8(&request_line) else {
+        let _ = write_response(&stream, 400, "invalid request");
+        return None;
+    };
     let mut parts = request_line.split_whitespace();
-    let method = parts.next()?.to_ascii_uppercase();
-    let target = parts.next()?;
-    let version = parts.next()?;
-    if parts.next().is_some() || method != "GET" || !matches!(version, "HTTP/1.0" | "HTTP/1.1") {
+    let Some(method) = parts.next() else {
+        let _ = write_response(&stream, 400, "invalid request");
+        return None;
+    };
+    let Some(target) = parts.next() else {
+        let _ = write_response(&stream, 400, "invalid request");
+        return None;
+    };
+    let Some(version) = parts.next() else {
+        let _ = write_response(&stream, 400, "invalid request");
+        return None;
+    };
+    if parts.next().is_some() || !matches!(version, "HTTP/1.0" | "HTTP/1.1") {
+        let _ = write_response(&stream, 400, "invalid request");
+        return None;
+    }
+    if !method.eq_ignore_ascii_case("GET") {
         let _ = write_response(&stream, 405, "method not allowed");
         return None;
     }
 
-    let url = Url::parse(&format!("http://127.0.0.1{target}")).ok()?;
+    let Ok(url) = Url::parse(&format!("http://127.0.0.1{target}")) else {
+        let _ = write_response(&stream, 400, "invalid request");
+        return None;
+    };
     if url.path() != "/cargo/registry-authorization" {
         let _ = write_response(&stream, 404, "not found");
         return None;
     }
-    let states: Vec<_> = url
-        .query_pairs()
-        .filter(|(key, _)| key == "state")
-        .map(|(_, value)| value.into_owned())
-        .collect();
-    if states.len() != 1 || !constant_time_eq(states[0].as_bytes(), expected_state.as_bytes()) {
+    let query: Vec<_> = url.query_pairs().collect();
+    if query.len() != 1
+        || query[0].0 != "state"
+        || !constant_time_eq(query[0].1.as_bytes(), expected_state.as_bytes())
+    {
         let _ = write_response(&stream, 403, "invalid callback state");
         return None;
     }
@@ -169,7 +197,7 @@ fn read_bounded_line(reader: &mut impl BufRead, max_bytes: usize) -> Option<Vec<
 fn write_response(mut stream: &TcpStream, code: u16, body: &str) -> std::io::Result<()> {
     write!(
         stream,
-        "HTTP/1.1 {code}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        "HTTP/1.1 {code}\r\nContent-Type: text/plain\r\nCache-Control: no-store\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     )?;
     stream.flush()

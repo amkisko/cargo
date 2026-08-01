@@ -196,6 +196,12 @@ fn poll_once(
 
     match status.status.as_str() {
         "ready" => {
+            if status.detail.is_some()
+                || status.challenge_expires_in.is_some()
+                || status.recommended_poll_interval_secs.is_some()
+            {
+                bail!("ready poll included fields from another status");
+            }
             validate_lifetime("grant_expires_in", status.grant_expires_in)?;
             let lease = if pending.idempotent_final {
                 match status.receive_lease_secs {
@@ -207,14 +213,29 @@ fn poll_once(
             };
             Ok(PollResult::Ready(lease))
         }
-        "pending" => Ok(PollResult::Pending(
-            Duration::from_secs(validate_lifetime(
-                "challenge_expires_in",
-                status.challenge_expires_in,
-            )?),
-            status.recommended_poll_interval_secs,
-        )),
+        "pending" => {
+            if status.detail.is_some()
+                || status.grant_expires_in.is_some()
+                || status.receive_lease_secs.is_some()
+            {
+                bail!("pending poll included fields from another status");
+            }
+            Ok(PollResult::Pending(
+                Duration::from_secs(validate_lifetime(
+                    "challenge_expires_in",
+                    status.challenge_expires_in,
+                )?),
+                status.recommended_poll_interval_secs,
+            ))
+        }
         "denied" | "expired" => {
+            if status.challenge_expires_in.is_some()
+                || status.grant_expires_in.is_some()
+                || status.receive_lease_secs.is_some()
+                || status.recommended_poll_interval_secs.is_some()
+            {
+                bail!("{} poll included fields from another status", status.status);
+            }
             let detail = status
                 .detail
                 .map(|value| format!(": {}", sanitize_detail(&value)))

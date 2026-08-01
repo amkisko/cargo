@@ -230,7 +230,7 @@ pub fn publish(ws: &Workspace<'_>, opts: &PublishOpts<'_>) -> CargoResult<()> {
             let hash = cargo_util::Sha256::new()
                 .update_file(tarball.file())?
                 .finish_hex();
-            if !opts.dry_run {
+            if !opts.dry_run && opts.token.is_none() {
                 let operation = Operation::Publish {
                     name: pkg.name().as_str(),
                     vers: &ver,
@@ -269,6 +269,7 @@ pub fn publish(ws: &Workspace<'_>, opts: &PublishOpts<'_>) -> CargoResult<()> {
                 &hash,
                 opts.reg_or_index.as_ref(),
                 opts.registry_authorization.as_deref(),
+                opts.token.is_none(),
                 opts.dry_run,
                 workspace_context,
             )?;
@@ -659,6 +660,7 @@ fn transmit(
     checksum: &str,
     reg_or_index: Option<&RegistryOrIndex>,
     registry_authorization: Option<&str>,
+    refresh_after_wait: bool,
     dry_run: bool,
     workspace_context: impl Fn() -> String,
 ) -> CargoResult<()> {
@@ -670,32 +672,28 @@ fn transmit(
         return Ok(());
     }
 
-    // Build the upload body once so MFA handshake retries do not re-read the tarball.
-    let (body, tarball_len) = Registry::<RegistryClient<'_>>::prepare_publish_body(
-        &new_crate, tarball,
-    )
-    .with_context(|| {
-        format!(
-            "failed to prepare {} v{} for upload to registry at {}{}",
-            pkg.name(),
-            pkg.version(),
-            registry.host(),
-            workspace_context()
-        )
-    })?;
+    // Hash the exact wire body without retaining the tarball while waiting for
+    // interactive authorization.
+    let (descriptor, descriptor_tarball_len) =
+        Registry::<RegistryClient<'_>>::prepare_publish_descriptor(&new_crate, tarball)
+            .with_context(|| {
+                format!(
+                    "failed to prepare {} v{} for upload to registry at {}{}",
+                    pkg.name(),
+                    pkg.version(),
+                    registry.host(),
+                    workspace_context()
+                )
+            })?;
 
-    let descriptor = crates_io::MutationDescriptor::publish(
-        &new_crate.name,
-        &new_crate.vers,
-        &body,
-        tarball_len,
-    );
+    let mut prepared_body = None;
     let warnings = super::mutation_authorization::with_mutation_authorization(
         gctx,
         registry,
         reg_or_index,
         registry_authorization,
         descriptor,
+        refresh_after_wait,
         || {
             auth::auth_token(
                 gctx,
@@ -710,7 +708,18 @@ fn transmit(
                 false,
             )
         },
-        |registry| registry.publish_body(&body, tarball_len),
+        |registry| {
+            if prepared_body.is_none() {
+                prepared_body = Some(Registry::<RegistryClient<'_>>::prepare_publish_body(
+                    &new_crate, tarball,
+                )?);
+            }
+            let (body, tarball_len) = prepared_body
+                .as_ref()
+                .expect("publish body initialized above");
+            debug_assert_eq!(*tarball_len, descriptor_tarball_len);
+            registry.publish_body(body, *tarball_len)
+        },
     )
     .with_context(|| {
         format!(

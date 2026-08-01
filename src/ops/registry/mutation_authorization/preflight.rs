@@ -87,7 +87,7 @@ pub(super) fn maybe_start_callback_listener(
     match CallbackListener::bind() {
         Ok(listener) => Ok(Some(listener)),
         Err(err) if channel == AuthorizationChannel::Loopback => Err(err).context(
-            "failed to bind the loopback listener requested by `--registry-authorization=loopback`",
+            "failed to bind the loopback listener requested by `--mutation-authorization-channel=loopback`",
         ),
         Err(err) => {
             let _ = gctx.shell().verbose(|shell| {
@@ -216,6 +216,9 @@ pub(super) fn validate_pending(
     idempotent_final: bool,
 ) -> CargoResult<PendingAuthorization> {
     validate_protocol_version(&response)?;
+    if response.grant_expires_in.is_some() || response.receive_lease_secs.is_some() {
+        bail!("pending preflight included ready-only lifetime fields");
+    }
     let detail = response
         .detail
         .filter(|detail| !detail.is_empty())
@@ -251,8 +254,45 @@ pub(super) fn validate_interaction_required(
     response: &MutationAuthorizationResponse,
 ) -> CargoResult<()> {
     validate_protocol_version(response)?;
-    if response.mutation_id.is_some() || response.poll_url.is_some() {
+    if response.mutation_id.is_some()
+        || response.poll_url.is_some()
+        || response.challenge_expires_in.is_some()
+        || response.grant_expires_in.is_some()
+        || response.receive_lease_secs.is_some()
+        || response.recommended_poll_interval_secs.is_some()
+    {
         bail!("interaction_required response created an actionable challenge");
+    }
+    if response.detail.as_deref().is_none_or(str::is_empty) {
+        bail!("interaction_required response omitted detail");
+    }
+    Ok(())
+}
+
+pub(super) fn validate_ready_fields(response: &MutationAuthorizationResponse) -> CargoResult<()> {
+    if response.detail.is_some()
+        || response.poll_url.is_some()
+        || response.challenge_expires_in.is_some()
+        || response.recommended_poll_interval_secs.is_some()
+    {
+        bail!("ready preflight included fields from another status");
+    }
+    Ok(())
+}
+
+pub(super) fn validate_terminal_preflight_fields(
+    response: &MutationAuthorizationResponse,
+) -> CargoResult<()> {
+    if response.poll_url.is_some()
+        || response.challenge_expires_in.is_some()
+        || response.grant_expires_in.is_some()
+        || response.receive_lease_secs.is_some()
+        || response.recommended_poll_interval_secs.is_some()
+    {
+        bail!(
+            "{} preflight included fields from another status",
+            response.status
+        );
     }
     Ok(())
 }

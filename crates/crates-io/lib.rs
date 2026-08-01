@@ -66,7 +66,7 @@ pub struct Registry<T: HttpClient> {
     auth_required: bool,
     /// Extra headers for the final idempotent mutation request.
     mutation_headers: MutationHeaders,
-    /// Optional bound for API response bodies while recognizing a reactive challenge.
+    /// Optional bound for mutation-authorization API response bodies.
     response_body_limit: Option<usize>,
 }
 
@@ -253,12 +253,6 @@ pub struct MutationAuthorizationResponse {
     pub mutation_id: Option<String>,
     #[serde(default)]
     pub detail: Option<String>,
-    #[serde(default)]
-    pub operation: Option<String>,
-    #[serde(default, rename = "crate")]
-    pub crate_name: Option<String>,
-    #[serde(default)]
-    pub operation_summary: Option<String>,
     #[serde(default)]
     pub poll_url: Option<String>,
     #[serde(default)]
@@ -620,11 +614,6 @@ impl<T: HttpClient> Registry<T> {
         if response.status() == StatusCode::NOT_FOUND {
             return Ok(None);
         }
-        if !has_no_store(response.headers()) {
-            return Err(Error::InvalidMutationAuthorizationResponse(
-                "preflight response must include Cache-Control: no-store".to_owned(),
-            ));
-        }
         let status = response.status();
         if !matches!(
             status,
@@ -635,6 +624,20 @@ impl<T: HttpClient> Registry<T> {
                     "preflight returned an invalid HTTP status".to_owned(),
                 ))
             });
+        }
+        if status == StatusCode::FORBIDDEN
+            && !matches!(
+                serde_json::from_slice::<MutationAuthorizationResponse>(response.body()),
+                Ok(MutationAuthorizationResponse { status, .. })
+                    if status == "interaction_required"
+            )
+        {
+            return self.handle(response).map(|_| None);
+        }
+        if !has_no_store(response.headers()) {
+            return Err(Error::InvalidMutationAuthorizationResponse(
+                "preflight response must include Cache-Control: no-store".to_owned(),
+            ));
         }
         let body = String::from_utf8(response.into_body())?;
         let response = serde_json::from_str(&body)?;
@@ -682,7 +685,6 @@ impl<T: HttpClient> Registry<T> {
         krate: &NewCrate,
         mut tarball: &File,
     ) -> RegistryResult<(Vec<u8>, u64), T::Error> {
-        let json = serde_json::to_string(krate)?;
         // Prepare the body. The format of the upload request is:
         //
         //      <le u32 of json>
@@ -697,16 +699,54 @@ impl<T: HttpClient> Registry<T> {
         // the file was renamed in ops::package.
         let tarball_len = tarball.seek(SeekFrom::End(0))?;
         tarball.seek(SeekFrom::Start(0))?;
-        let header = {
-            let mut w = Vec::new();
-            w.extend(&(json.len() as u32).to_le_bytes());
-            w.extend(json.as_bytes().iter().cloned());
-            w.extend(&(tarball_len as u32).to_le_bytes());
-            w
-        };
+        let header = prepare_publish_header(krate, tarball_len)?;
         let mut body = Vec::new();
         Cursor::new(header).chain(tarball).read_to_end(&mut body)?;
         Ok((body, tarball_len))
+    }
+
+    /// Hashes a publish request without retaining the tarball in memory.
+    ///
+    /// The file is rewound so [`Self::prepare_publish_body`] can materialize
+    /// the exact request after mutation authorization becomes ready.
+    pub fn prepare_publish_descriptor(
+        krate: &NewCrate,
+        mut tarball: &File,
+    ) -> RegistryResult<(MutationDescriptor, u64), T::Error> {
+        let tarball_len = tarball.seek(SeekFrom::End(0))?;
+        tarball.seek(SeekFrom::Start(0))?;
+        let header = prepare_publish_header(krate, tarball_len)?;
+        let mut request_hasher = Sha256::new();
+        request_hasher.update(&header);
+        let mut archive_hasher = Sha256::new();
+        let mut buffer = [0; 64 * 1024];
+        loop {
+            let bytes_read = tarball.read(&mut buffer)?;
+            if bytes_read == 0 {
+                break;
+            }
+            request_hasher.update(&buffer[..bytes_read]);
+            archive_hasher.update(&buffer[..bytes_read]);
+        }
+        tarball.seek(SeekFrom::Start(0))?;
+
+        Ok((
+            MutationDescriptor {
+                operation: "publish".to_owned(),
+                method: Method::PUT.as_str().to_owned(),
+                request_target: "/api/v1/crates/new".to_owned(),
+                content_type: Some("application/octet-stream".to_owned()),
+                crate_name: krate.name.clone(),
+                version: Some(krate.vers.clone()),
+                request_sha256: hex::encode(request_hasher.finalize()),
+                request_size: header.len() as u64 + tarball_len,
+                archive_sha256: Some(hex::encode(archive_hasher.finalize())),
+                archive_size: Some(tarball_len),
+                direction: None,
+                owners: None,
+            },
+            tarball_len,
+        ))
     }
 
     /// Uploads a body previously built by [`Self::prepare_publish_body`].
@@ -865,6 +905,13 @@ impl<T: HttpClient> Registry<T> {
                 location,
             });
         }
+        if response.status() != StatusCode::OK {
+            return self.handle(response).and_then(|_| {
+                Err(Error::InvalidMutationAuthorizationResponse(
+                    "poll returned an invalid HTTP status".to_owned(),
+                ))
+            });
+        }
         if !has_no_store(response.headers()) {
             return Err(Error::InvalidMutationAuthorizationResponse(
                 "poll response must include Cache-Control: no-store".to_owned(),
@@ -983,6 +1030,15 @@ impl<T: HttpClient> Registry<T> {
     }
 }
 
+fn prepare_publish_header(krate: &NewCrate, tarball_len: u64) -> serde_json::Result<Vec<u8>> {
+    let json = serde_json::to_string(krate)?;
+    let mut header = Vec::with_capacity(8 + json.len());
+    header.extend(&(json.len() as u32).to_le_bytes());
+    header.extend_from_slice(json.as_bytes());
+    header.extend(&(tarball_len as u32).to_le_bytes());
+    Ok(header)
+}
+
 /// Returns true when `url` shares scheme, host, and port with `registry_host`.
 pub fn url_shares_origin_with_registry(url: &str, registry_host: &str) -> bool {
     let Ok(url) = Url::parse(url) else {
@@ -1063,10 +1119,10 @@ mod tests {
     use std::rc::Rc;
 
     use super::{
-        CoreMutationDescriptor, HttpClient, MutationDescriptor, Registry,
+        CoreMutationDescriptor, Error, HttpClient, MutationDescriptor, Registry,
         url_shares_origin_with_registry,
     };
-    use http::{Request, Response};
+    use http::{Request, Response, StatusCode};
     use sha2::{Digest, Sha256};
 
     #[derive(Clone)]
@@ -1087,9 +1143,33 @@ mod tests {
             Ok(Response::builder()
                 .header("Cache-Control", "no-store")
                 .body(
-                    br#"{"status":"ready","protocol_version":1,"mutation_id":"mut_0123456789abcdefghijkl","grant_expires_in":300}"#
+                    br#"{"status":"ready","protocol_version":1,"active_extensions":["idempotent-final"],"mutation_id":"mut_0123456789abcdefghijkl","grant_expires_in":300,"receive_lease_secs":300}"#
                         .to_vec(),
                 )
+                .unwrap())
+        }
+    }
+
+    #[derive(Clone)]
+    struct StaticClient {
+        status: StatusCode,
+        body: &'static [u8],
+    }
+
+    impl HttpClient for StaticClient {
+        type Error = std::io::Error;
+
+        fn request(&self, _request: Request<Vec<u8>>) -> Result<Response<Vec<u8>>, Self::Error> {
+            unreachable!()
+        }
+
+        fn request_no_redirect(
+            &self,
+            _request: Request<Vec<u8>>,
+        ) -> Result<Response<Vec<u8>>, Self::Error> {
+            Ok(Response::builder()
+                .status(self.status)
+                .body(self.body.to_vec())
                 .unwrap())
         }
     }
@@ -1097,11 +1177,11 @@ mod tests {
     #[test]
     fn mutation_authorization_poll_url_same_origin() {
         assert!(url_shares_origin_with_registry(
-            "https://crates.io/api/v1/auth/challenges/stp_x",
+            "https://crates.io/api/v1/auth/mutation-challenges/poll/poll_x",
             "https://crates.io",
         ));
         assert!(url_shares_origin_with_registry(
-            "http://127.0.0.1:1234/api/v1/auth/challenges/stp_x",
+            "http://127.0.0.1:1234/api/v1/auth/mutation-challenges/poll/poll_x",
             "http://127.0.0.1:1234",
         ));
     }
@@ -1113,16 +1193,74 @@ mod tests {
             "https://crates.io",
         ));
         assert!(!url_shares_origin_with_registry(
-            "https://evil.example/api/v1/auth/challenges/stp_x",
+            "https://evil.example/api/v1/auth/challenges/mut_x",
             "https://crates.io",
         ));
         assert!(!url_shares_origin_with_registry(
-            "https://crates.io:443/api/v1/auth/challenges/stp_x",
+            "https://crates.io:443/api/v1/auth/challenges/mut_x",
             "http://crates.io",
         ));
         assert!(!url_shares_origin_with_registry(
             "not a url",
             "https://crates.io"
+        ));
+    }
+
+    #[test]
+    fn ordinary_preflight_forbidden_does_not_require_no_store() {
+        let client = StaticClient {
+            status: StatusCode::FORBIDDEN,
+            body: br#"{"errors":[{"detail":"token scope denied"}]}"#,
+        };
+        let mut registry = Registry::new_handle(
+            "https://registry.example".into(),
+            Some("token".into()),
+            client,
+            true,
+        );
+
+        let error = registry
+            .preflight_mutation(
+                &MutationDescriptor::yank("demo", "1.2.3", false),
+                "pf_0123456789abcdefghijkl",
+                false,
+                &[],
+                None,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            Error::Api {
+                code: StatusCode::FORBIDDEN,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn transient_poll_error_does_not_require_no_store() {
+        let client = StaticClient {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            body: br#"{"errors":[{"detail":"slow down"}]}"#,
+        };
+        let mut registry = Registry::new_handle(
+            "https://registry.example".into(),
+            Some("token".into()),
+            client,
+            true,
+        );
+
+        let error = registry
+            .poll_mutation_authorization(
+                "https://registry.example/api/v1/auth/mutation-challenges/poll/poll_x",
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            Error::Api {
+                code: StatusCode::TOO_MANY_REQUESTS,
+                ..
+            }
         ));
     }
 

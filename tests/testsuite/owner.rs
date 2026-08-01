@@ -199,6 +199,8 @@ fn simple_remove_with_asymmetric() {
 fn mutation_authorization_required_then_retry() {
     let owner_count = Arc::new(Mutex::new(0u32));
     let poll_count = Arc::new(Mutex::new(0u32));
+    let owner_responder_count = owner_count.clone();
+    let poll_responder_count = poll_count.clone();
 
     let registry = RegistryBuilder::new()
         .http_api()
@@ -224,7 +226,7 @@ fn mutation_authorization_required_then_retry() {
             if req.method != "put" {
                 return server.ok(req);
             }
-            let mut n = owner_count.lock().unwrap();
+            let mut n = owner_responder_count.lock().unwrap();
             *n += 1;
             assert_eq!(
                 req.cargo_mutation_id.as_deref(),
@@ -233,7 +235,7 @@ fn mutation_authorization_required_then_retry() {
             server.ok(req)
         })
         .add_responder("/api/v1/auth/mutation-challenges/poll/poll_owners_01234567", move |_req, _server| {
-            let mut n = poll_count.lock().unwrap();
+            let mut n = poll_responder_count.lock().unwrap();
             *n += 1;
             Response {
                 code: 200,
@@ -258,8 +260,11 @@ fn mutation_authorization_required_then_retry() {
         .file("src/main.rs", "fn main() {}")
         .build();
 
-    p.cargo("owner -a username --registry-authorization=poll")
+    p.cargo("owner -a username --mutation-authorization-channel=poll")
         .replace_crates_io(registry.index_url())
         .with_stderr_contains("[NOTE] registry authorization ready; continuing")
         .run();
+
+    assert_eq!(*owner_count.lock().unwrap(), 1);
+    assert_eq!(*poll_count.lock().unwrap(), 1);
 }

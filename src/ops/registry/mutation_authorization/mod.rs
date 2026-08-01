@@ -32,7 +32,8 @@ use preflight::{
     AuthorizationChannel, IDEMPOTENT_FINAL, LOOPBACK_CALLBACK, authorization_channel,
     is_noninteractive_authorization, maybe_start_callback_listener, random_protocol_id,
     validate_active_extensions, validate_interaction_required, validate_lifetime, validate_pending,
-    validate_protocol_id, validate_protocol_version, validate_receive_lease, validate_transport,
+    validate_protocol_id, validate_protocol_version, validate_ready_fields, validate_receive_lease,
+    validate_terminal_preflight_fields, validate_transport,
 };
 use retry::{bounded_retry_delay, final_request_is_retryable, final_request_retry_after};
 
@@ -43,6 +44,7 @@ pub(super) fn with_mutation_authorization<T, F, R>(
     reg_or_index: Option<&super::RegistryOrIndex>,
     channel_override: Option<&str>,
     descriptor: MutationDescriptor,
+    refresh_after_wait: bool,
     mut refresh_credential: R,
     mut op: F,
 ) -> CargoResult<T>
@@ -60,6 +62,7 @@ where
         registry,
         descriptor,
         channel,
+        refresh_after_wait,
         &mut refresh_credential,
         op,
     )
@@ -71,6 +74,7 @@ fn with_preflight<T, F, R>(
     registry: &mut Registry<RegistryClient<'_>>,
     descriptor: MutationDescriptor,
     channel: AuthorizationChannel,
+    refresh_after_wait: bool,
     refresh_credential: &mut R,
     mut op: F,
 ) -> CargoResult<T>
@@ -133,6 +137,7 @@ where
         let (mutation_id, receive_lease) = match response.status.as_str() {
             "ready" if http_status == http::StatusCode::OK => {
                 validate_protocol_version(&response)?;
+                validate_ready_fields(&response)?;
                 validate_lifetime("grant_expires_in", response.grant_expires_in)?;
                 let receive_lease =
                     validate_receive_lease(&response, active_extensions.idempotent_final)?;
@@ -159,11 +164,12 @@ where
                     .unwrap_or_else(|| "This operation requires registry authorization.".into());
                 bail!(
                     "{detail}\nno authorization challenge was created; rerun with \
-                     --registry-authorization=poll"
+                     --mutation-authorization-channel=poll"
                 );
             }
             "denied" | "expired" if http_status == http::StatusCode::OK => {
                 validate_protocol_version(&response)?;
+                validate_terminal_preflight_fields(&response)?;
                 let mutation_id = response.mutation_id.as_deref().ok_or_else(|| {
                     anyhow::format_err!("{} preflight omitted mutation_id", response.status)
                 })?;
@@ -183,7 +189,9 @@ where
             listener.shutdown();
         }
 
-        registry.set_token(Some(refresh_credential()?));
+        if refresh_after_wait {
+            registry.set_token(Some(refresh_credential()?));
+        }
         registry.set_mutation_headers(MutationHeaders {
             mutation_id: Some(mutation_id),
         });

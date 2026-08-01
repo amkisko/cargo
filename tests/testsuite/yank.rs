@@ -287,6 +287,8 @@ Caused by:
 fn mutation_authorization_required_then_retry() {
     let yank_count = Arc::new(Mutex::new(0u32));
     let poll_count = Arc::new(Mutex::new(0u32));
+    let yank_responder_count = yank_count.clone();
+    let poll_responder_count = poll_count.clone();
 
     let registry = RegistryBuilder::new()
         .http_api()
@@ -315,7 +317,7 @@ fn mutation_authorization_required_then_retry() {
             },
         )
         .add_responder("/api/v1/crates/foo/0.0.1/yank", move |req, server| {
-            let mut n = yank_count.lock().unwrap();
+            let mut n = yank_responder_count.lock().unwrap();
             *n += 1;
             assert_eq!(
                 req.cargo_mutation_id.as_deref(),
@@ -326,7 +328,7 @@ fn mutation_authorization_required_then_retry() {
         .add_responder(
             "/api/v1/auth/mutation-challenges/poll/poll_yank_0123456789",
             move |_req, _server| {
-                let mut n = poll_count.lock().unwrap();
+                let mut n = poll_responder_count.lock().unwrap();
                 *n += 1;
                 let body = if *n == 1 {
                     r#"{"status":"pending","challenge_expires_in":240,"recommended_poll_interval_secs":1}"#
@@ -357,11 +359,14 @@ fn mutation_authorization_required_then_retry() {
         .file("src/main.rs", "fn main() {}")
         .build();
 
-    p.cargo("yank --quiet --version 0.0.1 --registry-authorization=poll")
+    p.cargo("yank --quiet --version 0.0.1 --mutation-authorization-channel=poll")
         .replace_crates_io(registry.index_url())
         .with_stderr_contains("[..]Instructions from registry http://127.0.0.1:[..]:[..]")
         .with_stderr_contains(
             "[..]Waiting up to 300 seconds for registry authorization; press Ctrl-C to cancel.[..]",
         )
         .run();
+
+    assert_eq!(*yank_count.lock().unwrap(), 1);
+    assert_eq!(*poll_count.lock().unwrap(), 2);
 }
