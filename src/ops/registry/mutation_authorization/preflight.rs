@@ -187,10 +187,20 @@ pub(super) fn validate_receive_lease(
     response: &MutationAuthorizationResponse,
     idempotent_final: bool,
 ) -> CargoResult<Option<Duration>> {
+    validate_receive_lease_secs(response.receive_lease_secs, idempotent_final)
+}
+
+pub(super) fn validate_receive_lease_secs(
+    receive_lease_secs: Option<u64>,
+    idempotent_final: bool,
+) -> CargoResult<Option<Duration>> {
     if !idempotent_final {
+        if receive_lease_secs.is_some() {
+            bail!("receive_lease_secs requires the active idempotent-final extension");
+        }
         return Ok(None);
     }
-    match response.receive_lease_secs {
+    match receive_lease_secs {
         Some(value @ 1..=3600) => Ok(Some(Duration::from_secs(value))),
         _ => bail!("receive_lease_secs must be an integer from 1 through 3600"),
     }
@@ -299,4 +309,19 @@ pub(super) fn random_protocol_id(prefix: &str) -> String {
         "{prefix}_{}",
         Alphanumeric.sample_string(&mut rand::rng(), 32)
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_receive_lease_secs;
+
+    #[test]
+    fn receive_lease_requires_idempotent_final() {
+        let error = validate_receive_lease_secs(Some(300), false).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("requires the active idempotent-final extension")
+        );
+    }
 }

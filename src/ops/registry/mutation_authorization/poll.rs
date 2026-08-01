@@ -13,7 +13,7 @@ use crate::{CargoResult, GlobalContext};
 use super::super::RegistryClient;
 use super::callback::CallbackListener;
 use super::display::{detail_for_user, essential_note};
-use super::preflight::{PendingAuthorization, validate_lifetime};
+use super::preflight::{PendingAuthorization, validate_lifetime, validate_receive_lease_secs};
 use super::retry::{clamp_poll_interval, parse_retry_after, transient_poll_delay};
 
 pub(super) fn wait_for_authorization(
@@ -55,22 +55,9 @@ fn wait_for_callback(
     progress.tick_now(0, max, "for callback or registry authorization")?;
 
     loop {
-        if Instant::now() >= deadline {
-            bail!("timed out waiting for registry authorization; {detail}");
-        }
         let remaining = deadline.saturating_duration_since(Instant::now());
         match listener.receiver.recv_timeout(remaining.min(interval)) {
-            Ok(()) => match poll_once(registry, pending)? {
-                PollResult::Ready(receive_lease) => return ready(gctx, receive_lease),
-                PollResult::Pending(expires_in, recommended) => {
-                    deadline = deadline.min(Instant::now() + expires_in);
-                    interval = clamp_poll_interval(recommended);
-                }
-                PollResult::Transient(retry_after) => {
-                    interval = transient_poll_delay(interval, retry_after, deadline);
-                }
-            },
-            Err(mpsc::RecvTimeoutError::Timeout) => {
+            Ok(()) | Err(mpsc::RecvTimeoutError::Timeout) => {
                 match poll_once(registry, pending)? {
                     PollResult::Ready(receive_lease) => return ready(gctx, receive_lease),
                     PollResult::Pending(expires_in, recommended) => {
@@ -86,6 +73,9 @@ fn wait_for_callback(
                     max,
                     "for registry authorization",
                 )?;
+                if Instant::now() >= deadline {
+                    bail!("timed out waiting for registry authorization; {detail}");
+                }
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 return wait_for_ready(
@@ -115,9 +105,6 @@ fn wait_for_ready(
     progress.tick_now(0, max, "for registry authorization")?;
 
     loop {
-        if Instant::now() >= deadline {
-            bail!("timed out waiting for registry authorization; {detail}");
-        }
         progress.tick_now(
             started.elapsed().as_secs().min(max as u64) as usize,
             max,
@@ -134,10 +121,11 @@ fn wait_for_ready(
                 interval = transient_poll_delay(interval, retry_after, deadline);
             }
         }
-        let sleep_for = interval.min(deadline.saturating_duration_since(Instant::now()));
-        if !sleep_for.is_zero() {
-            std::thread::sleep(sleep_for);
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            bail!("timed out waiting for registry authorization; {detail}");
         }
+        std::thread::sleep(interval.min(remaining));
     }
 }
 
@@ -200,14 +188,8 @@ fn poll_once(
                 bail!("ready poll included fields from another status");
             }
             validate_lifetime("grant_expires_in", status.grant_expires_in)?;
-            let lease = if pending.idempotent_final {
-                match status.receive_lease_secs {
-                    Some(value @ 1..=3600) => Some(Duration::from_secs(value)),
-                    _ => bail!("receive_lease_secs must be an integer from 1 through 3600"),
-                }
-            } else {
-                None
-            };
+            let lease =
+                validate_receive_lease_secs(status.receive_lease_secs, pending.idempotent_final)?;
             Ok(PollResult::Ready(lease))
         }
         "pending" => {
