@@ -344,7 +344,8 @@ fn step_up_required_then_retry() {
         .with_stderr_data(str![[r#"
 [UPDATING] crates.io index
 [YANK] foo@0.0.1
-[NOTE] Additional authentication is required. Visit http://127.0.0.1:[..]/verify/stp_yank.
+[NOTE] Instructions from registry http://127.0.0.1:[..]:
+      Additional authentication is required. Visit http://127.0.0.1:[..]/verify/stp_yank.
 [NOTE] step-up acknowledged; retrying request
 
 "#]])

@@ -55,6 +55,9 @@ pub enum Error {
 
     #[error("failed to convert header value of `{name}` to string: {bytes:?}")]
     BadHeader { name: String, bytes: Vec<u8> },
+
+    #[error("HTTP response body exceeded the {limit}-byte limit")]
+    ResponseBodyTooLarge { limit: usize },
 }
 
 struct Message {
@@ -118,7 +121,12 @@ impl Client {
         // Configure the handle timeout since we're blocking here and not using the
         // client-level timeout.
         self.handle_config.timeout.configure2(&mut handle)?;
-        handle.perform()?;
+        if let Err(error) = handle.perform() {
+            if let Some(limit) = handle.get_ref().response_body_limit_exceeded {
+                return Err(Error::ResponseBodyTooLarge { limit });
+            }
+            return Err(error.into());
+        }
         Ok(WorkerServer::process_response(handle))
     }
 
@@ -143,6 +151,10 @@ impl Client {
         debug!(target: "network::fetch", url);
         let mut collector = Collector::new(self.stats.clone());
         let (parts, body) = request.into_parts();
+        collector.response_body_limit = parts
+            .extensions
+            .get::<crates_io::ResponseBodyLimit>()
+            .map(|limit| limit.0);
         collector.redact_debug_data = has_sensitive_step_up_headers(&parts.headers);
         let body_len = body.len();
         collector.request_body = Cursor::new(body);
@@ -359,8 +371,14 @@ impl WorkerServer {
                         };
                         let result = msg.result_for2(&handle).expect("handle must have a result");
                         let easy = self.multi.remove2(handle).expect("handle must be in multi");
+                        let response_body_limit_exceeded =
+                            easy.get_ref().response_body_limit_exceeded;
                         let response = Self::process_response(easy);
-                        let _ = sender.send(result.map(|()| response).map_err(Into::into));
+                        let result = match response_body_limit_exceeded {
+                            Some(limit) => Err(Error::ResponseBodyTooLarge { limit }),
+                            None => result.map(|()| response).map_err(Into::into),
+                        };
+                        let _ = sender.send(result);
                     });
 
                     if running > 0 {
@@ -451,6 +469,10 @@ struct Collector {
     debug: bool,
     /// Whether this transfer carries step-up credentials that could be reflected.
     redact_debug_data: bool,
+    /// Maximum response body accepted for this request, if any.
+    response_body_limit: Option<usize>,
+    /// Limit that was crossed while receiving the body.
+    response_body_limit_exceeded: Option<usize>,
     /// Global transfer statistics.
     global_stats: Arc<Stats>,
     /// How much has this particular transfer added to global `dl_remaining` stats.
@@ -464,6 +486,8 @@ impl Collector {
             request_body: Cursor::new(Vec::new()),
             debug: false,
             redact_debug_data: false,
+            response_body_limit: None,
+            response_body_limit_exceeded: None,
             global_stats: stats,
             dl_remaining_delta: 0,
         }
@@ -472,6 +496,12 @@ impl Collector {
 
 impl Handler for Collector {
     fn write(&mut self, data: &[u8]) -> Result<usize, WriteError> {
+        if let Some(limit) = self.response_body_limit
+            && self.response.body().len().saturating_add(data.len()) > limit
+        {
+            self.response_body_limit_exceeded = Some(limit);
+            return Ok(0);
+        }
         self.response.body_mut().extend_from_slice(data);
         self.global_stats
             .dl_transferred
@@ -590,7 +620,11 @@ fn handle_http_header(buf: &[u8]) -> Option<(&str, &str)> {
 
 #[cfg(test)]
 mod tests {
-    use super::has_sensitive_step_up_headers;
+    use std::sync::Arc;
+
+    use curl::easy::Handler;
+
+    use super::{Collector, Stats, has_sensitive_step_up_headers};
 
     #[test]
     fn step_up_credentials_mark_http_trace_as_sensitive() {
@@ -609,5 +643,16 @@ mod tests {
             http::HeaderValue::from_static("proof"),
         );
         assert!(has_sensitive_step_up_headers(&headers));
+    }
+
+    #[test]
+    fn response_body_limit_stops_collection_during_receipt() {
+        let mut collector = Collector::new(Arc::new(Stats::default()));
+        collector.response_body_limit = Some(4);
+
+        assert_eq!(collector.write(b"1234").unwrap(), 4);
+        assert_eq!(collector.write(b"5").unwrap(), 0);
+        assert_eq!(collector.response.body(), b"1234");
+        assert_eq!(collector.response_body_limit_exceeded, Some(4));
     }
 }

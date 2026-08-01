@@ -80,6 +80,7 @@ where
     F: FnMut(&mut Registry<RegistryClient<'_>>) -> Result<T, RegistryError<http_async::Error>>,
 {
     if registry.supports_step_up_preflight() {
+        validate_step_up_transport(registry.host())?;
         return with_preflight(gctx, registry, descriptor, op);
     }
 
@@ -192,6 +193,7 @@ where
     let mut listener = maybe_start_otp_listener(gctx, channel);
     let mut proof: Option<String> = None;
     let mut handshakes = 0u32;
+    registry.set_response_body_limit(Some(crates_io::STEP_UP_RESPONSE_MAX_BYTES));
 
     let result = (|| loop {
         registry.set_step_up_headers(StepUpHeaders {
@@ -234,6 +236,7 @@ where
     })();
 
     registry.clear_step_up_headers();
+    registry.set_response_body_limit(None);
     if let Some(listener) = listener.take() {
         listener.shutdown();
     }
@@ -265,46 +268,124 @@ fn detail_for_user(
     registry_host: &str,
     callback_secret: Option<&str>,
 ) -> CargoResult<String> {
-    let Some(callback_secret) = callback_secret else {
-        return Ok(detail.to_owned());
-    };
-
-    for word in detail.split_whitespace() {
-        let candidate = word.trim_matches(|character: char| {
-            matches!(
-                character,
-                '(' | ')' | '[' | ']' | '<' | '>' | ',' | ';' | '.' | '!'
-            )
-        });
-        let Ok(mut url) = Url::parse(candidate) else {
-            continue;
-        };
-        if !crates_io::url_shares_origin_with_registry(candidate, registry_host) {
-            continue;
-        }
-        if url.fragment().is_some() {
-            bail!("step-up instruction URL must not contain a fragment");
-        }
-        let fragment = url::form_urlencoded::Serializer::new(String::new())
-            .append_pair("callback_secret", callback_secret)
-            .finish();
-        url.set_fragment(Some(&fragment));
-        return Ok(detail.replacen(candidate, url.as_str(), 1));
+    if detail.len() > crates_io::STEP_UP_DETAIL_MAX_BYTES {
+        bail!(
+            "registry step-up instructions exceed the {}-byte limit",
+            crates_io::STEP_UP_DETAIL_MAX_BYTES
+        );
     }
 
-    Ok(detail.to_owned())
+    let mut detail = sanitize_step_up_detail(detail);
+    if let Some(callback_secret) = callback_secret {
+        for word in detail.split_whitespace() {
+            let candidate = instruction_url_candidate(word);
+            let Ok(mut url) = Url::parse(candidate) else {
+                continue;
+            };
+            if !crates_io::url_shares_origin_with_registry(candidate, registry_host) {
+                continue;
+            }
+            if url.fragment().is_some() {
+                bail!("step-up instruction URL must not contain a fragment");
+            }
+            let fragment = url::form_urlencoded::Serializer::new(String::new())
+                .append_pair("callback_secret", callback_secret)
+                .finish();
+            url.set_fragment(Some(&fragment));
+            detail = detail.replacen(candidate, url.as_str(), 1);
+            break;
+        }
+    }
+
+    let detail = label_external_instruction_urls(&detail, registry_host);
+    let registry_origin = Url::parse(registry_host)
+        .map(|url| url.origin().ascii_serialization())
+        .unwrap_or_else(|_| registry_host.trim_end_matches('/').to_owned());
+    Ok(format!(
+        "Instructions from registry {registry_origin}:\n{detail}"
+    ))
+}
+
+fn sanitize_step_up_detail(detail: &str) -> String {
+    detail
+        .replace("\r\n", "\n")
+        .replace('\r', "\n")
+        .chars()
+        .map(|character| match character {
+            '\n' => '\n',
+            character if character.is_control() || is_bidi_formatting_control(character) => {
+                '\u{fffd}'
+            }
+            character => character,
+        })
+        .collect()
+}
+
+fn is_bidi_formatting_control(character: char) -> bool {
+    matches!(
+        character,
+        '\u{061c}'
+            | '\u{200e}'
+            | '\u{200f}'
+            | '\u{202a}'..='\u{202e}'
+            | '\u{2066}'..='\u{2069}'
+    )
+}
+
+fn instruction_url_candidate(word: &str) -> &str {
+    word.trim().trim_matches(|character: char| {
+        matches!(
+            character,
+            '(' | ')' | '[' | ']' | '{' | '}' | '<' | '>' | '\'' | '"' | ',' | ';' | '.' | '!'
+        )
+    })
+}
+
+fn label_external_instruction_urls(detail: &str, registry_host: &str) -> String {
+    detail
+        .split_inclusive(char::is_whitespace)
+        .map(|word| {
+            let candidate = instruction_url_candidate(word);
+            let Ok(url) = Url::parse(candidate) else {
+                return word.to_owned();
+            };
+            if !matches!(url.scheme(), "http" | "https")
+                || crates_io::url_shares_origin_with_registry(candidate, registry_host)
+            {
+                return word.to_owned();
+            }
+            word.replacen(candidate, &format!("[external URL: {url}]"), 1)
+        })
+        .collect()
 }
 
 fn validate_step_up_url(
     registry: &Registry<RegistryClient<'_>>,
     step_up: &StepUpRequired,
 ) -> CargoResult<()> {
+    validate_step_up_transport(registry.host())?;
     let registry_origin = registry.host().trim_end_matches('/');
     if !crates_io::url_shares_origin_with_registry(&step_up.poll_url, registry.host()) {
         bail!(
             "refusing to poll step-up status at `{}`; URL must use the same origin as the registry API ({})",
             step_up.poll_url,
             registry_origin
+        );
+    }
+    Ok(())
+}
+
+fn validate_step_up_transport(registry_host: &str) -> CargoResult<()> {
+    let url = Url::parse(registry_host)?;
+    let loopback = match url.host() {
+        Some(url::Host::Ipv4(address)) => address.is_loopback(),
+        Some(url::Host::Ipv6(address)) => address.is_loopback(),
+        Some(url::Host::Domain(domain)) => domain.eq_ignore_ascii_case("localhost"),
+        None => false,
+    };
+    if url.scheme() != "https" && !loopback {
+        bail!(
+            "step-up authentication requires HTTPS for non-loopback registries; configured registry is `{registry_host}`"
         );
     }
     Ok(())
@@ -443,10 +524,7 @@ fn poll_step_up_once(
         Err(RegistryError::Code { code, .. }) | Err(RegistryError::Api { code, .. })
             if code.as_u16() == 404 =>
         {
-            bail!(
-                "step-up challenge expired or was not found; {}",
-                step_up.detail
-            );
+            bail!("step-up challenge expired or was not found");
         }
         Err(err) => return Err(err.into()),
     };
@@ -728,7 +806,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             detail,
-            "Authenticate at https://registry.example/verify/stp_test#callback_secret=callback_secret-_."
+            "Instructions from registry https://registry.example:\nAuthenticate at https://registry.example/verify/stp_test#callback_secret=callback_secret-_."
         );
         assert_eq!(
             detail_for_user(
@@ -737,8 +815,31 @@ mod tests {
                 None,
             )
             .unwrap(),
-            "Press the registered hardware button."
+            "Instructions from registry https://registry.example:\nPress the registered hardware button."
         );
+    }
+
+    #[test]
+    fn detail_is_plain_text_and_external_urls_are_labeled() {
+        let detail = detail_for_user(
+            "Run\u{1b}[31m this\u{202e} command or visit https://evil.example/login.\r\nThen continue.",
+            "https://registry.example",
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            detail,
+            "Instructions from registry https://registry.example:\nRun�[31m this� command or visit [external URL: https://evil.example/login].\nThen continue."
+        );
+    }
+
+    #[test]
+    fn step_up_transport_requires_https_except_on_loopback() {
+        validate_step_up_transport("https://registry.example").unwrap();
+        validate_step_up_transport("http://127.0.0.1:1234").unwrap();
+        validate_step_up_transport("http://[::1]:1234").unwrap();
+        assert!(validate_step_up_transport("http://registry.example").is_err());
     }
 
     #[test]

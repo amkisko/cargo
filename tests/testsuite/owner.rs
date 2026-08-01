@@ -258,7 +258,8 @@ fn step_up_required_then_retry() {
         .env("CARGO_REGISTRY_STEP_UP_CHANNEL", "poll")
         .with_stderr_data(str![[r#"
 [UPDATING] crates.io index
-[NOTE] Additional authentication is required. Visit http://127.0.0.1:[..]/verify/stp_owners.
+[NOTE] Instructions from registry http://127.0.0.1:[..]:
+      Additional authentication is required. Visit http://127.0.0.1:[..]/verify/stp_owners.
 [NOTE] step-up acknowledged; retrying request
 [OWNER] completed!
 

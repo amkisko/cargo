@@ -4997,7 +4997,8 @@ fn step_up_callback_falls_back_to_poll_then_retry() {
 [PACKAGING] foo v0.0.1 ([..]foo)
 [PACKAGED] 4 files, [FILE_SIZE]B ([FILE_SIZE]B compressed)
 [UPLOADING] foo v0.0.1 ([..]foo)
-[NOTE] Additional authentication is required. Visit http://127.0.0.1:[..]/verify/stp_testop#callback_secret=[..].
+[NOTE] Instructions from registry http://127.0.0.1:[..]:
+      Additional authentication is required. Visit http://127.0.0.1:[..]/verify/stp_testop#callback_secret=[..].
 [NOTE] step-up acknowledged; retrying request
 [UPLOADED] foo v0.0.1 to registry `alternative`
 [NOTE] waiting for foo v0.0.1 to be available at registry `alternative`
@@ -5084,6 +5085,42 @@ fn step_up_preflight_uploads_publish_body_once() {
     assert_eq!(*publish_count2.lock().unwrap(), 1);
 }
 
+/// Cargo stops receiving an oversized step-up response before parsing it.
+#[cargo_test]
+fn step_up_rejects_oversized_preflight_response() {
+    let _registry = RegistryBuilder::new()
+        .alternative()
+        .http_api()
+        .step_up_auth()
+        .add_responder("/api/v1/auth/challenges", |_req, _server| Response {
+            code: 403,
+            headers: vec!["Cache-Control: no-store".into()],
+            body: vec![b'x'; crates_io::STEP_UP_RESPONSE_MAX_BYTES + 1],
+        })
+        .build();
+
+    let p = project()
+        .file(
+            "Cargo.toml",
+            r#"
+                [package]
+                name = "foo"
+                version = "0.0.1"
+                edition = "2015"
+                authors = []
+                license = "MIT"
+                description = "foo"
+            "#,
+        )
+        .file("src/lib.rs", "")
+        .build();
+
+    p.cargo("publish --no-verify --registry alternative")
+        .with_status(101)
+        .with_stderr_contains("[..]HTTP response body exceeded the 65536-byte limit[..]")
+        .run();
+}
+
 /// Cargo refuses HTTP redirects on step-up poll URLs (SSRF via Location).
 #[cargo_test]
 fn step_up_rejects_poll_redirect() {
@@ -5138,7 +5175,8 @@ fn step_up_rejects_poll_redirect() {
 [PACKAGING] foo v0.0.1 ([..]foo)
 [PACKAGED] 4 files, [FILE_SIZE]B ([FILE_SIZE]B compressed)
 [UPLOADING] foo v0.0.1 ([..]foo)
-[NOTE] Additional authentication is required. Visit http://127.0.0.1:[..]/verify/stp_redir.
+[NOTE] Instructions from registry http://127.0.0.1:[..]:
+      Additional authentication is required. Visit http://127.0.0.1:[..]/verify/stp_redir.
 [ERROR] failed to publish foo v0.0.1 to registry at http://127.0.0.1:[..]/
 
 Caused by:
@@ -5254,11 +5292,12 @@ fn step_up_poll_not_found() {
 [PACKAGING] foo v0.0.1 ([..]foo)
 [PACKAGED] 4 files, [FILE_SIZE]B ([FILE_SIZE]B compressed)
 [UPLOADING] foo v0.0.1 ([..]foo)
-[NOTE] Additional authentication is required. Visit http://127.0.0.1:[..]/verify/stp_gone and retry the original command.
+[NOTE] Instructions from registry http://127.0.0.1:[..]:
+      Additional authentication is required. Visit http://127.0.0.1:[..]/verify/stp_gone and retry the original command.
 [ERROR] failed to publish foo v0.0.1 to registry at http://127.0.0.1:[..]/
 
 Caused by:
-  step-up challenge expired or was not found; Additional authentication is required. Visit http://127.0.0.1:[..]/verify/stp_gone and retry the original command.
+  step-up challenge expired or was not found
 
 "#]])
         .run();
@@ -5357,7 +5396,8 @@ fn step_up_localhost_otp_then_retry() {
 [PACKAGING] foo v0.0.1 ([..]foo)
 [PACKAGED] 4 files, [FILE_SIZE]B ([FILE_SIZE]B compressed)
 [UPLOADING] foo v0.0.1 ([..]foo)
-[NOTE] Additional authentication is required. Visit http://127.0.0.1:[..]/verify/stp_otp#callback_secret=[..].
+[NOTE] Instructions from registry http://127.0.0.1:[..]:
+      Additional authentication is required. Visit http://127.0.0.1:[..]/verify/stp_otp#callback_secret=[..].
 [NOTE] step-up proof received; retrying request
 [UPLOADED] foo v0.0.1 to registry `alternative`
 [NOTE] waiting for foo v0.0.1 to be available at registry `alternative`
@@ -5435,7 +5475,8 @@ fn step_up_fail_fast_when_noninteractive() {
 [ERROR] failed to publish foo v0.0.1 to registry at http://127.0.0.1:[..]/
 
 Caused by:
-  additional authentication is required but Cargo is running non-interactively; Additional authentication is required. Visit http://127.0.0.1:[..]/verify/stp_ci from an interactive session.
+  additional authentication is required but Cargo is running non-interactively; Instructions from registry http://127.0.0.1:[..]:
+  Additional authentication is required. Visit http://127.0.0.1:[..]/verify/stp_ci from an interactive session.
 
 "#]])
         .run();

@@ -204,6 +204,7 @@ fn maybe_spurious(err: &Error) -> bool {
             http_async::Error::TooSlow { .. } => return true,
             http_async::Error::Multi(_) => {}
             http_async::Error::BadHeader { .. } => {}
+            http_async::Error::ResponseBodyTooLarge { .. } => {}
         }
     }
     if let Some(git_err) = err.downcast_ref::<git2::Error>() {

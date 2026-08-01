@@ -15,6 +15,18 @@ use url::Url;
 
 type RegistryResult<T, E> = Result<T, Error<E>>;
 
+/// Maximum UTF-8 byte length of step-up instructions in protocol version 1.
+pub const STEP_UP_DETAIL_MAX_BYTES: usize = 8 * 1024;
+/// Maximum response-body size accepted for a step-up preflight or poll.
+pub const STEP_UP_RESPONSE_MAX_BYTES: usize = 64 * 1024;
+
+/// Request extension asking an HTTP client to stop receiving after this many bytes.
+///
+/// Clients that do not understand this extension can ignore it. This crate also
+/// checks the completed response, while Cargo's client enforces it during receipt.
+#[derive(Clone, Copy, Debug)]
+pub struct ResponseBodyLimit(pub usize);
+
 /// Perform an HTTP request and return the response.
 ///
 /// Users of this crate must provide an implementation of this
@@ -46,6 +58,8 @@ pub struct Registry<T: HttpClient> {
     step_up_auth_version: Option<u64>,
     /// Extra headers for interactive step-up (localhost port / proof retry).
     step_up_headers: StepUpHeaders,
+    /// Optional bound for API response bodies while recognizing a reactive challenge.
+    response_body_limit: Option<usize>,
 }
 
 /// Optional headers for the registry interactive step-up handshake.
@@ -396,6 +410,14 @@ pub enum Error<T> {
         location: Option<String>,
     },
 
+    /// A bounded step-up response exceeded the protocol implementation limit.
+    #[error("registry step-up response exceeded the {limit}-byte limit")]
+    StepUpResponseTooLarge { limit: usize },
+
+    /// A structured step-up challenge contained invalid instructions.
+    #[error("invalid registry step-up challenge: {0}")]
+    InvalidStepUpChallenge(String),
+
     /// Error from API response which didn't have pre-programmed `errors.details`.
     #[error(
         "failed to get a 200 OK response, got {}\nheaders:\n\t{}\nbody:\n{body}",
@@ -453,6 +475,7 @@ impl<T: HttpClient> Registry<T> {
             auth_required,
             step_up_auth_version: None,
             step_up_headers: StepUpHeaders::default(),
+            response_body_limit: None,
         }
     }
 
@@ -480,17 +503,23 @@ impl<T: HttpClient> Registry<T> {
         self.step_up_headers = StepUpHeaders::default();
     }
 
+    /// Bounds subsequent API response bodies, including while they are received by Cargo.
+    pub fn set_response_body_limit(&mut self, limit: Option<usize>) {
+        self.response_body_limit = limit;
+    }
+
     /// Creates or reuses the mutation record for an exact mutation descriptor.
     pub fn preflight_mutation(
         &mut self,
         descriptor: &MutationDescriptor,
     ) -> RegistryResult<StepUpReady, T::Error> {
         let body = serde_json::to_vec(descriptor)?;
-        let response = self.req(
+        let response = self.req_with_response_body_limit(
             Method::POST,
             "/auth/challenges",
             Some(&body),
             Auth::Authorized,
+            STEP_UP_RESPONSE_MAX_BYTES,
         )?;
         Ok(serde_json::from_str(&response)?)
     }
@@ -683,11 +712,20 @@ impl<T: HttpClient> Registry<T> {
             .method(Method::GET)
             .uri(poll_url)
             .header(http::header::ACCEPT, "application/json");
-        let request = request.body(Vec::new())?;
+        let mut request = request.body(Vec::new())?;
+        request
+            .extensions_mut()
+            .insert(ResponseBodyLimit(STEP_UP_RESPONSE_MAX_BYTES));
         let response = self
             .handle
             .request_no_redirect(request)
             .map_err(Error::Transport)?;
+
+        if response.body().len() > STEP_UP_RESPONSE_MAX_BYTES {
+            return Err(Error::StepUpResponseTooLarge {
+                limit: STEP_UP_RESPONSE_MAX_BYTES,
+            });
+        }
 
         if response.status().is_redirection() {
             let location = response
@@ -735,6 +773,28 @@ impl<T: HttpClient> Registry<T> {
         body: Option<&[u8]>,
         authorized: Auth,
     ) -> RegistryResult<String, T::Error> {
+        self.req_inner(method, path, body, authorized, self.response_body_limit)
+    }
+
+    fn req_with_response_body_limit(
+        &mut self,
+        method: Method,
+        path: &str,
+        body: Option<&[u8]>,
+        authorized: Auth,
+        response_body_limit: usize,
+    ) -> RegistryResult<String, T::Error> {
+        self.req_inner(method, path, body, authorized, Some(response_body_limit))
+    }
+
+    fn req_inner(
+        &mut self,
+        method: Method,
+        path: &str,
+        body: Option<&[u8]>,
+        authorized: Auth,
+        response_body_limit: Option<usize>,
+    ) -> RegistryResult<String, T::Error> {
         let url = self.api_url(path);
         let mut request = http::Request::builder()
             .method(method)
@@ -748,8 +808,16 @@ impl<T: HttpClient> Registry<T> {
             request = request.header(http::header::AUTHORIZATION, self.token()?);
             request = self.apply_step_up_headers(request);
         }
-        let request = request.body(body.unwrap_or_default().to_vec())?;
+        let mut request = request.body(body.unwrap_or_default().to_vec())?;
+        if let Some(limit) = response_body_limit {
+            request.extensions_mut().insert(ResponseBodyLimit(limit));
+        }
         let response = self.handle.request(request).map_err(Error::Transport)?;
+        if let Some(limit) = response_body_limit
+            && response.body().len() > limit
+        {
+            return Err(Error::StepUpResponseTooLarge { limit });
+        }
         self.handle(response)
     }
 
@@ -786,10 +854,14 @@ impl<T: HttpClient> Registry<T> {
         // returns `200 OK` for cargo endpoints even on failures (`cargo_compat`
         // AdjustAll), so do not gate on HTTP status — look for the structured
         // `step_up_required` error object whenever the body parses as an error list.
-        if let Some(list) = &api_errors
-            && let Some(step_up) = list.errors.iter().find_map(step_up_required_from_api_error)
-        {
-            return Err(Error::StepUpRequired(step_up));
+        if let Some(list) = &api_errors {
+            for error in &list.errors {
+                if let Some(step_up) =
+                    step_up_required_from_api_error(error).map_err(Error::InvalidStepUpChallenge)?
+                {
+                    return Err(Error::StepUpRequired(step_up));
+                }
+            }
         }
 
         let errors = api_errors.map(|s| s.errors.into_iter().map(|s| s.detail).collect::<Vec<_>>());
@@ -823,13 +895,25 @@ fn redact_step_up_credentials(mut body: String, headers: &StepUpHeaders) -> Stri
     body
 }
 
-fn step_up_required_from_api_error(err: &ApiError) -> Option<StepUpRequired> {
+fn step_up_required_from_api_error(err: &ApiError) -> Result<Option<StepUpRequired>, String> {
     if err.id.as_deref() != Some("step_up_required") || err.protocol_version != Some(1) {
-        return None;
+        return Ok(None);
     }
-    let poll_url = err.poll_url.clone()?;
-    let challenge_id = err.challenge_id.clone()?;
-    Some(StepUpRequired {
+    if err.detail.is_empty() {
+        return Err("`detail` must not be empty".to_owned());
+    }
+    if err.detail.len() > STEP_UP_DETAIL_MAX_BYTES {
+        return Err(format!(
+            "`detail` exceeds the {STEP_UP_DETAIL_MAX_BYTES}-byte limit"
+        ));
+    }
+    let Some(poll_url) = err.poll_url.clone() else {
+        return Ok(None);
+    };
+    let Some(challenge_id) = err.challenge_id.clone() else {
+        return Ok(None);
+    };
+    Ok(Some(StepUpRequired {
         detail: err.detail.clone(),
         challenge_id,
         protocol_version: 1,
@@ -838,7 +922,7 @@ fn step_up_required_from_api_error(err: &ApiError) -> Option<StepUpRequired> {
         poll_url,
         recommended_poll_interval_secs: err.recommended_poll_interval_secs,
         expires_at: err.expires_at.clone(),
-    })
+    }))
 }
 
 /// Returns true when `url` shares scheme, host, and port with `registry_host`.
@@ -949,7 +1033,7 @@ mod tests {
     #[test]
     fn step_up_required_parses_version_one_contract() {
         let error = valid_step_up_error();
-        let step_up = step_up_required_from_api_error(&error).unwrap();
+        let step_up = step_up_required_from_api_error(&error).unwrap().unwrap();
         assert_eq!(step_up.protocol_version, 1);
         assert_eq!(step_up.detail, "Additional authentication is required");
         assert_eq!(
@@ -962,19 +1046,46 @@ mod tests {
     fn step_up_required_rejects_incomplete_or_unknown_contracts() {
         let mut missing_version = valid_step_up_error();
         missing_version.protocol_version = None;
-        assert!(step_up_required_from_api_error(&missing_version).is_none());
+        assert!(
+            step_up_required_from_api_error(&missing_version)
+                .unwrap()
+                .is_none()
+        );
 
         let mut unknown_version = valid_step_up_error();
         unknown_version.protocol_version = Some(2);
-        assert!(step_up_required_from_api_error(&unknown_version).is_none());
+        assert!(
+            step_up_required_from_api_error(&unknown_version)
+                .unwrap()
+                .is_none()
+        );
 
         let mut missing_poll_url = valid_step_up_error();
         missing_poll_url.poll_url = None;
-        assert!(step_up_required_from_api_error(&missing_poll_url).is_none());
+        assert!(
+            step_up_required_from_api_error(&missing_poll_url)
+                .unwrap()
+                .is_none()
+        );
 
         let mut missing_challenge_id = valid_step_up_error();
         missing_challenge_id.challenge_id = None;
-        assert!(step_up_required_from_api_error(&missing_challenge_id).is_none());
+        assert!(
+            step_up_required_from_api_error(&missing_challenge_id)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn step_up_required_rejects_oversized_detail() {
+        let mut error = valid_step_up_error();
+        error.detail = "x".repeat(super::STEP_UP_DETAIL_MAX_BYTES + 1);
+
+        assert_eq!(
+            step_up_required_from_api_error(&error).unwrap_err(),
+            "`detail` exceeds the 8192-byte limit"
+        );
     }
 
     fn valid_step_up_error() -> ApiError {
