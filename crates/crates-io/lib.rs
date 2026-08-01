@@ -1025,9 +1025,7 @@ mod tests {
     use std::cell::RefCell;
     use std::rc::Rc;
 
-    use super::{
-        HttpClient, MutationDescriptor, Registry, url_shares_origin_with_registry,
-    };
+    use super::{HttpClient, MutationDescriptor, Registry, url_shares_origin_with_registry};
     use http::{Request, Response};
     use sha2::{Digest, Sha256};
 
@@ -1037,10 +1035,7 @@ mod tests {
     impl HttpClient for RecordingClient {
         type Error = std::io::Error;
 
-        fn request(
-            &self,
-            _request: Request<Vec<u8>>,
-        ) -> Result<Response<Vec<u8>>, Self::Error> {
+        fn request(&self, _request: Request<Vec<u8>>) -> Result<Response<Vec<u8>>, Self::Error> {
             unreachable!()
         }
 
@@ -1139,12 +1134,7 @@ mod tests {
         let descriptor = MutationDescriptor::yank("demo", "1.2.3", false);
 
         registry
-            .preflight_mutation(
-                &descriptor,
-                "pf_0123456789abcdefghijkl",
-                false,
-                None,
-            )
+            .preflight_mutation(&descriptor, "pf_0123456789abcdefghijkl", false, None)
             .unwrap();
 
         let request = request.borrow();
@@ -1153,8 +1143,7 @@ mod tests {
             request.uri().path(),
             "/tenant/api/v1/auth/mutation-challenges"
         );
-        let body: serde_json::Value =
-            serde_json::from_slice(request.body()).unwrap();
+        let body: serde_json::Value = serde_json::from_slice(request.body()).unwrap();
         assert_eq!(
             body["request_target"],
             "/tenant/api/v1/crates/demo/1.2.3/yank"
