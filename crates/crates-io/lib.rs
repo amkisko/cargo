@@ -72,27 +72,63 @@ pub struct MutationHeaders {
     pub mutation_id: Option<String>,
 }
 
-/// Exact mutation descriptor sent before an idempotency-first registry mutation.
-#[derive(Debug, Clone, Serialize)]
+/// Exact descriptor for a registry mutation-authorization preflight.
+#[derive(Debug, Clone)]
 pub struct MutationDescriptor {
     operation: String,
     method: String,
     request_target: String,
     content_type: Option<String>,
-    #[serde(rename = "crate")]
     crate_name: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
     version: Option<String>,
     request_sha256: String,
     request_size: u64,
-    #[serde(skip_serializing_if = "Option::is_none")]
     archive_sha256: Option<String>,
+    archive_size: Option<u64>,
+    direction: Option<String>,
+    owners: Option<Vec<String>>,
+}
+
+#[derive(Debug, Serialize)]
+struct CoreMutationDescriptor<'a> {
+    operation: &'a str,
+    #[serde(rename = "crate")]
+    crate_name: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    version: Option<&'a str>,
+    request_sha256: &'a str,
+    request_size: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    archive_sha256: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     archive_size: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    direction: Option<String>,
+    direction: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    owners: Option<Vec<String>>,
+    owners: Option<&'a [String]>,
+}
+
+impl<'a> From<&'a MutationDescriptor> for CoreMutationDescriptor<'a> {
+    fn from(descriptor: &'a MutationDescriptor) -> Self {
+        Self {
+            operation: &descriptor.operation,
+            crate_name: &descriptor.crate_name,
+            version: descriptor.version.as_deref(),
+            request_sha256: &descriptor.request_sha256,
+            request_size: descriptor.request_size,
+            archive_sha256: descriptor.archive_sha256.as_deref(),
+            archive_size: descriptor.archive_size,
+            direction: descriptor.direction.as_deref(),
+            owners: descriptor.owners.as_deref(),
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct IdempotentMutationDescriptor<'a> {
+    method: &'a str,
+    request_target: String,
+    content_type: Option<&'a str>,
 }
 
 impl MutationDescriptor {
@@ -195,7 +231,9 @@ struct MutationPreflight<'a> {
     preflight_id: &'a str,
     allow_pending: bool,
     #[serde(flatten)]
-    descriptor: &'a MutationDescriptor,
+    descriptor: CoreMutationDescriptor<'a>,
+    #[serde(flatten, skip_serializing_if = "Option::is_none")]
+    idempotent: Option<IdempotentMutationDescriptor<'a>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     callback: Option<&'a MutationCallback>,
 }
@@ -215,8 +253,6 @@ pub struct MutationAuthorizationResponse {
     pub crate_name: Option<String>,
     #[serde(default)]
     pub operation_summary: Option<String>,
-    #[serde(default)]
-    pub verification_url: Option<String>,
     #[serde(default)]
     pub poll_url: Option<String>,
     #[serde(default)]
@@ -534,26 +570,35 @@ impl<T: HttpClient> Registry<T> {
         descriptor: &MutationDescriptor,
         preflight_id: &str,
         allow_pending: bool,
+        idempotent_final: bool,
         callback: Option<&MutationCallback>,
     ) -> RegistryResult<(StatusCode, MutationAuthorizationResponse), T::Error> {
-        let mut descriptor = descriptor.clone();
-        let endpoint = descriptor
-            .request_target
-            .strip_prefix("/api/v1")
-            .ok_or_else(|| {
-                Error::InvalidStepUpChallenge(
-                    "mutation request_target did not use the registry API path".to_owned(),
-                )
-            })?;
-        descriptor.request_target = Url::parse(&self.api_url(endpoint))
-            .map_err(|error| Error::InvalidStepUpChallenge(error.to_string()))?
-            .path()
-            .to_owned();
+        let idempotent = if idempotent_final {
+            let endpoint = descriptor
+                .request_target
+                .strip_prefix("/api/v1")
+                .ok_or_else(|| {
+                    Error::InvalidStepUpChallenge(
+                        "mutation request_target did not use the registry API path".to_owned(),
+                    )
+                })?;
+            Some(IdempotentMutationDescriptor {
+                method: &descriptor.method,
+                request_target: Url::parse(&self.api_url(endpoint))
+                    .map_err(|error| Error::InvalidStepUpChallenge(error.to_string()))?
+                    .path()
+                    .to_owned(),
+                content_type: descriptor.content_type.as_deref(),
+            })
+        } else {
+            None
+        };
         let body = serde_json::to_vec(&MutationPreflight {
             protocol_version: 1,
             preflight_id,
             allow_pending,
-            descriptor: &descriptor,
+            descriptor: descriptor.into(),
+            idempotent,
             callback,
         })?;
         let mut request = http::Request::builder()
@@ -1020,7 +1065,10 @@ mod tests {
     use std::cell::RefCell;
     use std::rc::Rc;
 
-    use super::{HttpClient, MutationDescriptor, Registry, url_shares_origin_with_registry};
+    use super::{
+        CoreMutationDescriptor, HttpClient, MutationDescriptor, Registry,
+        url_shares_origin_with_registry,
+    };
     use http::{Request, Response};
     use sha2::{Digest, Sha256};
 
@@ -1086,7 +1134,7 @@ mod tests {
         let mut body = b"metadata-prefix".to_vec();
         body.extend_from_slice(b"archive");
         let descriptor = MutationDescriptor::publish("demo", "1.2.3", &body, 7);
-        let descriptor = serde_json::to_value(descriptor).unwrap();
+        let descriptor = serde_json::to_value(CoreMutationDescriptor::from(&descriptor)).unwrap();
 
         assert_eq!(descriptor["request_size"], body.len());
         assert_eq!(
@@ -1104,7 +1152,7 @@ mod tests {
     fn owner_descriptor_hashes_the_mutation_json() {
         let owners = ["alice", "github:org:team"];
         let descriptor = MutationDescriptor::owners("demo", &owners, true).unwrap();
-        let descriptor = serde_json::to_value(descriptor).unwrap();
+        let descriptor = serde_json::to_value(CoreMutationDescriptor::from(&descriptor)).unwrap();
         let body = br#"{"users":["alice","github:org:team"]}"#;
 
         assert_eq!(descriptor["direction"], "add");
@@ -1129,7 +1177,7 @@ mod tests {
         let descriptor = MutationDescriptor::yank("demo", "1.2.3", false);
 
         registry
-            .preflight_mutation(&descriptor, "pf_0123456789abcdefghijkl", false, None)
+            .preflight_mutation(&descriptor, "pf_0123456789abcdefghijkl", false, true, None)
             .unwrap();
 
         let request = request.borrow();

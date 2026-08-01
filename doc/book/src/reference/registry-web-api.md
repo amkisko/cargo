@@ -54,7 +54,7 @@ core descriptor binds the raw body SHA-256 and size and the operation-specific
 crate, version, owner, and archive facts. `idempotent-final` additionally binds
 the method, request target, and normalized content type. A callback-capable
 client can also register the exact loopback URL
-`http://127.0.0.1:{port}/cargo/registry-authorization`.
+`http://127.0.0.1:{port}/cargo/registry-authorization?state={random}`.
 
 A `200 OK` response with `status: "ready"` provides a `mutation_id` and
 `grant_expires_in`. A `202 Accepted` response with `status: "pending"` provides
@@ -62,13 +62,15 @@ complete plain-text `detail`, that mutation id, an independent same-origin
 `poll_url`, and `challenge_expires_in`. When `allow_pending` is false and
 authorization would require waiting, the registry returns
 `interaction_required` with `403 Forbidden` and creates no record.
+Cargo renders `detail` as bounded inert text, neutralizes terminal controls,
+attributes it to the registry origin, and keeps essential wait output visible
+under `--quiet`.
 
 Cargo polls without its primary credential. Poll status is `pending`, `ready`,
-`denied`, or `expired`. When `loopback-callback` is advertised, a loopback
-callback carries only client-generated `state` and causes an immediate poll;
-it is never proof of authorization. Cargo adds the state to the structured
-same-origin `verification_url` as a URL fragment, so it is not sent to the
-registry.
+`denied`, or `expired`. When `loopback-callback` is advertised, Cargo registers
+a loopback URL containing client-generated `state`. Loading that URL causes an
+immediate poll; it is never proof of authorization. Human-readable verification
+instructions remain entirely in `detail`.
 
 After `ready`, Cargo obtains an ordinary primary credential and sends the
 original mutation with `Cargo-Mutation-Id`. The registry checks its credential
@@ -77,10 +79,11 @@ retry ambiguous or transient final requests; the registry executes the logical
 mutation at most once and replays its retained terminal response. Preflight
 never stages an upload or reserves a version.
 
-`CARGO_REGISTRY_MUTATION_AUTHORIZATION_CHANNEL` selects `auto`, `loopback`,
-`poll`, or `disabled`. In non-interactive `auto` mode Cargo still preflights
-with `allow_pending: false`, allowing policy-exempt credentials to proceed
-without creating an abandoned challenge.
+`CARGO_REGISTRY_MUTATION_AUTHORIZATION_CHANNEL` selects the core `auto`,
+`poll`, or `disabled` mode. The `loopback-callback` extension adds `loopback`
+and can optimize interactive `auto`. In non-interactive `auto` mode Cargo still
+preflights with `allow_pending: false`, allowing policy-exempt credentials to
+proceed without creating an abandoned challenge.
 
 Cargo sets the `User-Agent` header for all requests to the Cargo version such
 as `cargo/1.32.0 (8610973aa 2019-01-02)`. This may be modified by the user in

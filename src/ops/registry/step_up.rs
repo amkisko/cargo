@@ -111,10 +111,7 @@ where
         registry.supports_mutation_authorization_extension(IDEMPOTENT_FINAL_EXTENSION);
     let mut listener = maybe_start_callback_listener(gctx, channel, loopback_supported);
     let callback = listener.as_ref().map(|listener| MutationCallback {
-        url: format!(
-            "http://127.0.0.1:{}/cargo/registry-authorization",
-            listener.port
-        ),
+        url: listener.url(),
     });
     let allow_pending = !is_noninteractive_authorization(gctx, channel);
     let preflight_id = random_protocol_id("pf");
@@ -124,11 +121,18 @@ where
             &descriptor,
             &preflight_id,
             allow_pending,
+            idempotent_final,
             callback.as_ref(),
         );
         let (http_status, response) = match preflight {
             Err(RegistryError::Transport(_) | RegistryError::Timeout(_)) => registry
-                .preflight_mutation(&descriptor, &preflight_id, allow_pending, callback.as_ref())?,
+                .preflight_mutation(
+                    &descriptor,
+                    &preflight_id,
+                    allow_pending,
+                    idempotent_final,
+                    callback.as_ref(),
+                )?,
             result => result?,
         };
         let (mutation_id, grant_lifetime) = match response.status.as_str() {
@@ -146,14 +150,7 @@ where
             }
             "pending" if http_status == http::StatusCode::ACCEPTED && allow_pending => {
                 let pending = validate_pending(registry, response)?;
-                let detail = detail_for_user(
-                    &pending.detail,
-                    registry.host(),
-                    pending.verification_url.as_deref(),
-                    listener
-                        .as_ref()
-                        .map(|listener| listener.callback_state.as_str()),
-                )?;
+                let detail = detail_for_user(&pending.detail, registry.host())?;
                 let grant_lifetime =
                     wait_for_authorization(gctx, registry, &pending, &detail, listener.as_ref())?;
                 (pending.mutation_id, grant_lifetime)
@@ -217,7 +214,6 @@ struct PendingAuthorization {
     detail: String,
     mutation_id: String,
     poll_url: String,
-    verification_url: Option<String>,
     challenge_expires_in: u64,
     recommended_poll_interval_secs: Option<u64>,
 }
@@ -280,7 +276,6 @@ fn validate_pending(
         detail,
         mutation_id,
         poll_url,
-        verification_url: response.verification_url,
         challenge_expires_in,
         recommended_poll_interval_secs: response.recommended_poll_interval_secs,
     })
@@ -288,10 +283,7 @@ fn validate_pending(
 
 fn validate_interaction_required(response: &MutationAuthorizationResponse) -> CargoResult<()> {
     validate_protocol_version(response)?;
-    if response.mutation_id.is_some()
-        || response.poll_url.is_some()
-        || response.verification_url.is_some()
-    {
+    if response.mutation_id.is_some() || response.poll_url.is_some() {
         bail!("interaction_required response created an actionable challenge");
     }
     Ok(())
@@ -331,13 +323,7 @@ fn essential_note(gctx: &GlobalContext, message: &str) -> CargoResult<()> {
     }
 }
 
-/// Adds client-held callback state only to the structured verification URL.
-fn detail_for_user(
-    detail: &str,
-    registry_host: &str,
-    verification_url: Option<&str>,
-    callback_state: Option<&str>,
-) -> CargoResult<String> {
+fn detail_for_user(detail: &str, registry_host: &str) -> CargoResult<String> {
     if detail.len() > crates_io::STEP_UP_DETAIL_MAX_BYTES {
         bail!(
             "registry step-up instructions exceed the {}-byte limit",
@@ -345,27 +331,7 @@ fn detail_for_user(
         );
     }
 
-    let mut detail = sanitize_step_up_detail(detail);
-    if let (Some(verification_url), Some(callback_state)) = (verification_url, callback_state) {
-        let mut url = Url::parse(verification_url)?;
-        if verification_url.len() > crates_io::STEP_UP_DETAIL_MAX_BYTES
-            || !crates_io::url_shares_origin_with_registry(verification_url, registry_host)
-            || url.fragment().is_some()
-        {
-            bail!("verification_url must be same-origin, fragment-free, and at most 8192 bytes");
-        }
-        let fragment = url::form_urlencoded::Serializer::new(String::new())
-            .append_pair("callback_state", callback_state)
-            .finish();
-        url.set_fragment(Some(&fragment));
-        if detail.contains(verification_url) {
-            detail = detail.replacen(verification_url, url.as_str(), 1);
-        } else {
-            detail.push_str("\n");
-            detail.push_str(url.as_str());
-        }
-    }
-
+    let detail = sanitize_step_up_detail(detail);
     let detail = label_external_instruction_urls(&detail, registry_host);
     let registry_origin = Url::parse(registry_host)
         .map(|url| url.origin().ascii_serialization())
@@ -899,6 +865,13 @@ impl CallbackListener {
         })
     }
 
+    fn url(&self) -> String {
+        format!(
+            "http://127.0.0.1:{}/cargo/registry-authorization?state={}",
+            self.port, self.callback_state
+        )
+    }
+
     fn shutdown(mut self) {
         self.done.store(true, Ordering::SeqCst);
         // Wake a blocking accept so the thread can exit.
@@ -1036,37 +1009,10 @@ mod tests {
     use std::time::Instant;
 
     #[test]
-    fn callback_state_is_added_only_to_structured_verification_url() {
-        let detail = detail_for_user(
-            "Use the registry verification page.",
-            "https://registry.example",
-            Some("https://registry.example/verify/mut_test"),
-            Some("callback_state-_"),
-        )
-        .unwrap();
-        assert_eq!(
-            detail,
-            "Instructions from registry https://registry.example:\nUse the registry verification page.\nhttps://registry.example/verify/mut_test#callback_state=callback_state-_"
-        );
-        assert_eq!(
-            detail_for_user(
-                "Press the registered hardware button.",
-                "https://registry.example",
-                None,
-                None,
-            )
-            .unwrap(),
-            "Instructions from registry https://registry.example:\nPress the registered hardware button."
-        );
-    }
-
-    #[test]
     fn detail_is_plain_text_and_external_urls_are_labeled() {
         let detail = detail_for_user(
             "Run\u{1b}[31m this\u{202e} command or visit https://evil.example/login.\r\nThen continue.",
             "https://registry.example",
-            None,
-            None,
         )
         .unwrap();
 
@@ -1082,22 +1028,6 @@ mod tests {
         validate_step_up_transport("http://127.0.0.1:1234").unwrap();
         validate_step_up_transport("http://[::1]:1234").unwrap();
         assert!(validate_step_up_transport("http://registry.example").is_err());
-    }
-
-    #[test]
-    fn callback_state_rejects_a_registry_fragment() {
-        let error = detail_for_user(
-            "Authenticate with the registry.",
-            "https://registry.example",
-            Some("https://registry.example/verify/mut_test#registry-state"),
-            Some("callback_state"),
-        )
-        .unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("verification_url must be same-origin, fragment-free")
-        );
     }
 
     #[test]
@@ -1142,6 +1072,13 @@ mod tests {
     #[test]
     fn localhost_listener_accepts_valid_wakeup() {
         let listener = CallbackListener::bind().unwrap();
+        let registered_url = Url::parse(&listener.url()).unwrap();
+        assert_eq!(registered_url.host_str(), Some("127.0.0.1"));
+        assert_eq!(registered_url.port(), Some(listener.port));
+        assert_eq!(
+            registered_url.query_pairs().collect::<Vec<_>>(),
+            vec![("state".into(), listener.callback_state.as_str().into())]
+        );
         let mut stream = TcpStream::connect(("127.0.0.1", listener.port)).unwrap();
         write!(
             stream,

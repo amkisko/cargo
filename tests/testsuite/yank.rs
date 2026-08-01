@@ -282,7 +282,7 @@ Caused by:
         .run();
 }
 
-/// Cargo preflights an advertised yank, polls until ready, then sends it once.
+/// Core-only mutation authorization polls until ready, then sends the yank once.
 #[cargo_test]
 fn step_up_required_then_retry() {
     let yank_count = Arc::new(Mutex::new(0u32));
@@ -290,7 +290,7 @@ fn step_up_required_then_retry() {
 
     let registry = RegistryBuilder::new()
         .http_api()
-        .step_up_auth()
+        .step_up_auth_core()
         .add_responder(
             "/api/v1/auth/mutation-challenges",
             move |req, _server| {
@@ -299,6 +299,9 @@ fn step_up_required_then_retry() {
                     serde_json::from_slice(req.body.as_deref().unwrap()).unwrap();
                 assert_eq!(descriptor["operation"], "yank");
                 assert_eq!(descriptor["allow_pending"], true);
+                assert!(descriptor.get("method").is_none());
+                assert!(descriptor.get("request_target").is_none());
+                assert!(descriptor.get("content_type").is_none());
                 let body = format!(
                     r#"{{"status":"pending","detail":"Authorize this yank at {origin}/verify/mut_yank.","protocol_version":1,"mutation_id":"mut_yank_0123456789012345","poll_url":"{origin}/api/v1/auth/mutation-challenges/poll/poll_yank_0123456789","challenge_expires_in":300,"recommended_poll_interval_secs":1}}"#
                 );
