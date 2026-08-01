@@ -20,7 +20,7 @@ pub struct OwnersOptions {
     pub krate: Option<String>,
     pub token: Option<Secret<String>>,
     pub reg_or_index: Option<RegistryOrIndex>,
-    pub registry_authorization: Option<String>,
+    pub mutation_authorization_mode: Option<String>,
     pub to_add: Option<Vec<String>>,
     pub to_remove: Option<Vec<String>>,
     pub list: bool,
@@ -54,7 +54,7 @@ pub fn modify_owners(gctx: &GlobalContext, opts: &OwnersOptions) -> CargoResult<
             gctx,
             &mut registry,
             opts.reg_or_index.as_ref(),
-            opts.registry_authorization.as_deref(),
+            opts.mutation_authorization_mode.as_deref(),
             descriptor,
             opts.token.is_none(),
             || {
@@ -89,7 +89,7 @@ pub fn modify_owners(gctx: &GlobalContext, opts: &OwnersOptions) -> CargoResult<
             gctx,
             &mut registry,
             opts.reg_or_index.as_ref(),
-            opts.registry_authorization.as_deref(),
+            opts.mutation_authorization_mode.as_deref(),
             descriptor,
             opts.token.is_none(),
             || {

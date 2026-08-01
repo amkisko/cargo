@@ -15,10 +15,10 @@ use super::callback::CallbackListener;
 
 pub(super) const IDEMPOTENT_FINAL: &str = "idempotent-final";
 pub(super) const LOOPBACK_CALLBACK: &str = "loopback-callback";
-const CHANNEL_ENV: &str = "CARGO_REGISTRY_MUTATION_AUTHORIZATION_CHANNEL";
+const MODE_ENV: &str = "CARGO_REGISTRY_MUTATION_AUTHORIZATION_MODE";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum AuthorizationChannel {
+pub(super) enum AuthorizationMode {
     Auto,
     Loopback,
     Poll,
@@ -40,54 +40,54 @@ pub(super) fn validate_transport(registry_host: &str) -> CargoResult<()> {
     Ok(())
 }
 
-pub(super) fn authorization_channel(
+pub(super) fn authorization_mode(
     gctx: &GlobalContext,
     reg_or_index: Option<&RegistryOrIndex>,
-    channel_override: Option<&str>,
-) -> CargoResult<AuthorizationChannel> {
+    mode_override: Option<&str>,
+) -> CargoResult<AuthorizationMode> {
     let configured: String;
-    let value = if let Some(value) = channel_override {
+    let value = if let Some(value) = mode_override {
         value
-    } else if let Ok(value) = gctx.get_env(CHANNEL_ENV) {
+    } else if let Ok(value) = gctx.get_env(MODE_ENV) {
         configured = value.to_owned();
         &configured
     } else {
         let key = match reg_or_index {
             Some(RegistryOrIndex::Registry(name)) if name != "crates-io" => {
-                format!("registries.{name}.mutation-authorization-channel")
+                format!("registries.{name}.mutation-authorization-mode")
             }
-            _ => "registry.mutation-authorization-channel".to_owned(),
+            _ => "registry.mutation-authorization-mode".to_owned(),
         };
         configured = gctx.get::<Option<String>>(&key)?.unwrap_or_default();
         &configured
     };
     match value.trim().to_ascii_lowercase().as_str() {
-        "" | "auto" => Ok(AuthorizationChannel::Auto),
-        "loopback" => Ok(AuthorizationChannel::Loopback),
-        "poll" => Ok(AuthorizationChannel::Poll),
-        "disabled" => Ok(AuthorizationChannel::Disabled),
-        _ => bail!(
-            "invalid {CHANNEL_ENV} value `{value}`; expected auto, loopback, poll, or disabled"
-        ),
+        "" | "auto" => Ok(AuthorizationMode::Auto),
+        "loopback" => Ok(AuthorizationMode::Loopback),
+        "poll" => Ok(AuthorizationMode::Poll),
+        "disabled" => Ok(AuthorizationMode::Disabled),
+        _ => {
+            bail!("invalid {MODE_ENV} value `{value}`; expected auto, loopback, poll, or disabled")
+        }
     }
 }
 
 pub(super) fn maybe_start_callback_listener(
     gctx: &GlobalContext,
-    channel: AuthorizationChannel,
+    mode: AuthorizationMode,
 ) -> CargoResult<Option<CallbackListener>> {
-    let use_loopback = match channel {
-        AuthorizationChannel::Auto => prefer_loopback_callback(gctx),
-        AuthorizationChannel::Loopback => true,
-        AuthorizationChannel::Poll | AuthorizationChannel::Disabled => false,
+    let use_loopback = match mode {
+        AuthorizationMode::Auto => prefer_loopback_callback(gctx),
+        AuthorizationMode::Loopback => true,
+        AuthorizationMode::Poll | AuthorizationMode::Disabled => false,
     };
     if !use_loopback {
         return Ok(None);
     }
     match CallbackListener::bind() {
         Ok(listener) => Ok(Some(listener)),
-        Err(err) if channel == AuthorizationChannel::Loopback => Err(err).context(
-            "failed to bind the loopback listener requested by `--mutation-authorization-channel=loopback`",
+        Err(err) if mode == AuthorizationMode::Loopback => Err(err).context(
+            "failed to bind the loopback listener requested by `--mutation-authorization-mode=loopback`",
         ),
         Err(err) => {
             let _ = gctx.shell().verbose(|shell| {
@@ -102,12 +102,9 @@ pub(super) fn maybe_start_callback_listener(
 
 pub(super) fn is_noninteractive_authorization(
     gctx: &GlobalContext,
-    channel: AuthorizationChannel,
+    mode: AuthorizationMode,
 ) -> bool {
-    if matches!(
-        channel,
-        AuthorizationChannel::Loopback | AuthorizationChannel::Poll
-    ) {
+    if matches!(mode, AuthorizationMode::Loopback | AuthorizationMode::Poll) {
         return false;
     }
     is_ci_env(gctx) || !std::io::stdin().is_terminal()

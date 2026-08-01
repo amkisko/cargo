@@ -26,10 +26,10 @@ use crate::util::network::http_async;
 use super::RegistryClient;
 #[cfg(test)]
 use callback::CallbackListener;
-use display::{detail_for_user, sanitize_detail};
+use display::detail_for_user;
 use poll::wait_for_authorization;
 use preflight::{
-    AuthorizationChannel, IDEMPOTENT_FINAL, LOOPBACK_CALLBACK, authorization_channel,
+    AuthorizationMode, IDEMPOTENT_FINAL, LOOPBACK_CALLBACK, authorization_mode,
     is_noninteractive_authorization, maybe_start_callback_listener, random_protocol_id,
     validate_active_extensions, validate_interaction_required, validate_lifetime, validate_pending,
     validate_protocol_id, validate_protocol_version, validate_ready_fields, validate_receive_lease,
@@ -42,7 +42,7 @@ pub(super) fn with_mutation_authorization<T, F, R>(
     gctx: &GlobalContext,
     registry: &mut Registry<RegistryClient<'_>>,
     reg_or_index: Option<&super::RegistryOrIndex>,
-    channel_override: Option<&str>,
+    mode_override: Option<&str>,
     descriptor: MutationDescriptor,
     refresh_after_wait: bool,
     mut refresh_credential: R,
@@ -52,8 +52,8 @@ where
     F: FnMut(&mut Registry<RegistryClient<'_>>) -> Result<T, RegistryError<http_async::Error>>,
     R: FnMut() -> CargoResult<String>,
 {
-    let channel = authorization_channel(gctx, reg_or_index, channel_override)?;
-    if channel == AuthorizationChannel::Disabled {
+    let mode = authorization_mode(gctx, reg_or_index, mode_override)?;
+    if mode == AuthorizationMode::Disabled {
         return op(registry).map_err(Into::into);
     }
     validate_transport(registry.host())?;
@@ -61,7 +61,7 @@ where
         gctx,
         registry,
         descriptor,
-        channel,
+        mode,
         refresh_after_wait,
         &mut refresh_credential,
         op,
@@ -73,7 +73,7 @@ fn with_preflight<T, F, R>(
     gctx: &GlobalContext,
     registry: &mut Registry<RegistryClient<'_>>,
     descriptor: MutationDescriptor,
-    channel: AuthorizationChannel,
+    mode: AuthorizationMode,
     refresh_after_wait: bool,
     refresh_credential: &mut R,
     mut op: F,
@@ -82,7 +82,7 @@ where
     F: FnMut(&mut Registry<RegistryClient<'_>>) -> Result<T, RegistryError<http_async::Error>>,
     R: FnMut() -> CargoResult<String>,
 {
-    let mut listener = maybe_start_callback_listener(gctx, channel)?;
+    let mut listener = maybe_start_callback_listener(gctx, mode)?;
     let callback = listener.as_ref().map(|listener| MutationCallback {
         url: listener.url(),
     });
@@ -90,7 +90,7 @@ where
     if callback.is_some() {
         requested_extensions.push(LOOPBACK_CALLBACK);
     }
-    let allow_pending = !is_noninteractive_authorization(gctx, channel);
+    let allow_pending = !is_noninteractive_authorization(gctx, mode);
     let preflight_id = random_protocol_id("pf");
 
     let result = (|| {
@@ -116,7 +116,7 @@ where
             result => result?,
         };
         let Some((http_status, response)) = response else {
-            if channel == AuthorizationChannel::Loopback {
+            if mode == AuthorizationMode::Loopback {
                 bail!(
                     "registry does not implement mutation authorization and cannot activate the \
                      `loopback-callback` extension"
@@ -125,7 +125,7 @@ where
             return op(registry).map_err(Into::into);
         };
         let active_extensions = validate_active_extensions(&response, &requested_extensions)?;
-        if channel == AuthorizationChannel::Loopback && !active_extensions.loopback_callback {
+        if mode == AuthorizationMode::Loopback && !active_extensions.loopback_callback {
             bail!("registry did not activate the `loopback-callback` authorization extension");
         }
         if !active_extensions.loopback_callback
@@ -160,11 +160,11 @@ where
                 let detail = response
                     .detail
                     .as_deref()
-                    .map(sanitize_detail)
-                    .unwrap_or_else(|| "This operation requires registry authorization.".into());
+                    .ok_or_else(|| anyhow::format_err!("interaction_required omitted detail"))?;
+                let detail = detail_for_user(detail, registry.host())?;
                 bail!(
                     "{detail}\nno authorization challenge was created; rerun with \
-                     --mutation-authorization-channel=poll"
+                     --mutation-authorization-mode=poll"
                 );
             }
             "denied" | "expired" if http_status == http::StatusCode::OK => {

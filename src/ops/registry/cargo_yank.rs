@@ -22,7 +22,7 @@ pub fn yank(
     version: Option<String>,
     token: Option<Secret<String>>,
     reg_or_index: Option<RegistryOrIndex>,
-    registry_authorization: Option<String>,
+    mutation_authorization_mode: Option<String>,
     undo: bool,
 ) -> CargoResult<()> {
     let name = match krate {
@@ -66,7 +66,7 @@ pub fn yank(
             gctx,
             &mut registry,
             reg_or_index.as_ref(),
-            registry_authorization.as_deref(),
+            mutation_authorization_mode.as_deref(),
             descriptor,
             token.is_none(),
             || {
@@ -97,7 +97,7 @@ pub fn yank(
             gctx,
             &mut registry,
             reg_or_index.as_ref(),
-            registry_authorization.as_deref(),
+            mutation_authorization_mode.as_deref(),
             descriptor,
             token.is_none(),
             || {

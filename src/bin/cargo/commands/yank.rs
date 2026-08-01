@@ -21,10 +21,10 @@ pub fn cli() -> Command {
         .arg_registry("Registry to yank from")
         .arg(
             opt(
-                "mutation-authorization-channel",
-                "Select registry mutation authorization channel",
+                "mutation-authorization-mode",
+                "Select registry mutation authorization behavior",
             )
-            .value_name("CHANNEL")
+            .value_name("MODE")
             .value_parser(["auto", "loopback", "poll", "disabled"]),
         )
         .arg(opt("token", "API token to use when authenticating").value_name("TOKEN"))
@@ -49,7 +49,7 @@ pub fn exec(gctx: &mut GlobalContext, args: &ArgMatches) -> CliResult {
         version.map(|s| s.to_string()),
         args.get_one::<String>("token").cloned().map(Secret::from),
         args.registry_or_index(gctx)?,
-        args.get_one::<String>("mutation-authorization-channel")
+        args.get_one::<String>("mutation-authorization-mode")
             .cloned(),
         args.flag("undo"),
     )?;

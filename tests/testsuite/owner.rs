@@ -260,7 +260,7 @@ fn mutation_authorization_required_then_retry() {
         .file("src/main.rs", "fn main() {}")
         .build();
 
-    p.cargo("owner -a username --mutation-authorization-channel=poll")
+    p.cargo("owner -a username --mutation-authorization-mode=poll")
         .replace_crates_io(registry.index_url())
         .with_stderr_contains("[NOTE] registry authorization ready; continuing")
         .run();

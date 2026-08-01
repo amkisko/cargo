@@ -12,7 +12,7 @@ use crate::{CargoResult, GlobalContext};
 
 use super::super::RegistryClient;
 use super::callback::CallbackListener;
-use super::display::{essential_note, sanitize_detail};
+use super::display::{detail_for_user, essential_note};
 use super::preflight::{PendingAuthorization, validate_lifetime};
 use super::retry::{clamp_poll_interval, parse_retry_after, transient_poll_delay};
 
@@ -118,13 +118,6 @@ fn wait_for_ready(
         if Instant::now() >= deadline {
             bail!("timed out waiting for registry authorization; {detail}");
         }
-        let sleep_for = interval.min(deadline.saturating_duration_since(Instant::now()));
-        if !sleep_for.is_zero() {
-            std::thread::sleep(sleep_for);
-        }
-        if Instant::now() >= deadline {
-            bail!("timed out waiting for registry authorization; {detail}");
-        }
         progress.tick_now(
             started.elapsed().as_secs().min(max as u64) as usize,
             max,
@@ -140,6 +133,10 @@ fn wait_for_ready(
             PollResult::Transient(retry_after) => {
                 interval = transient_poll_delay(interval, retry_after, deadline);
             }
+        }
+        let sleep_for = interval.min(deadline.saturating_duration_since(Instant::now()));
+        if !sleep_for.is_zero() {
+            std::thread::sleep(sleep_for);
         }
     }
 }
@@ -238,7 +235,9 @@ fn poll_once(
             }
             let detail = status
                 .detail
-                .map(|value| format!(": {}", sanitize_detail(&value)))
+                .map(|value| detail_for_user(&value, registry.host()))
+                .transpose()?
+                .map(|value| format!("\n{value}"))
                 .unwrap_or_default();
             bail!("registry authorization was {}{detail}", status.status)
         }

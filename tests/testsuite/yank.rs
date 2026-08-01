@@ -359,7 +359,7 @@ fn mutation_authorization_required_then_retry() {
         .file("src/main.rs", "fn main() {}")
         .build();
 
-    p.cargo("yank --quiet --version 0.0.1 --mutation-authorization-channel=poll")
+    p.cargo("yank --quiet --version 0.0.1 --mutation-authorization-mode=poll")
         .replace_crates_io(registry.index_url())
         .with_stderr_contains("[..]Instructions from registry http://127.0.0.1:[..]:[..]")
         .with_stderr_contains(
@@ -369,4 +369,68 @@ fn mutation_authorization_required_then_retry() {
 
     assert_eq!(*yank_count.lock().unwrap(), 1);
     assert_eq!(*poll_count.lock().unwrap(), 2);
+}
+
+/// Cargo polls once before waiting for the registry's recommended interval.
+#[cargo_test]
+fn mutation_authorization_polls_before_initial_interval() {
+    let poll_count = Arc::new(Mutex::new(0u32));
+    let poll_responder_count = poll_count.clone();
+
+    let registry = RegistryBuilder::new()
+        .http_api()
+        .add_responder(
+            "/api/v1/auth/mutation-challenges",
+            move |req, _server| {
+                let origin = req.url.origin().ascii_serialization();
+                Response {
+                    code: 202,
+                    headers: vec!["Cache-Control: no-store".into()],
+                    body: format!(
+                        r#"{{"status":"pending","detail":"Authorize this yank.","protocol_version":1,"active_extensions":[],"mutation_id":"mut_prompt_poll_0123456789","poll_url":"{origin}/api/v1/auth/mutation-challenges/poll/poll_prompt_0123456789","challenge_expires_in":1,"recommended_poll_interval_secs":30}}"#
+                    )
+                    .into_bytes(),
+                }
+            },
+        )
+        .add_responder(
+            "/api/v1/auth/mutation-challenges/poll/poll_prompt_0123456789",
+            move |_req, _server| {
+                *poll_responder_count.lock().unwrap() += 1;
+                Response {
+                    code: 200,
+                    headers: vec!["Cache-Control: no-store".into()],
+                    body: br#"{"status":"ready","grant_expires_in":300}"#.to_vec(),
+                }
+            },
+        )
+        .add_responder("/api/v1/crates/foo/0.0.1/yank", move |req, server| {
+            assert_eq!(
+                req.cargo_mutation_id.as_deref(),
+                Some("mut_prompt_poll_0123456789")
+            );
+            server.ok(req)
+        })
+        .build();
+
+    let p = project()
+        .file(
+            "Cargo.toml",
+            r#"
+                [package]
+                name = "foo"
+                version = "0.0.1"
+                authors = []
+                license = "MIT"
+                description = "foo"
+            "#,
+        )
+        .file("src/main.rs", "fn main() {}")
+        .build();
+
+    p.cargo("yank --quiet --version 0.0.1 --mutation-authorization-mode=poll")
+        .replace_crates_io(registry.index_url())
+        .run();
+
+    assert_eq!(*poll_count.lock().unwrap(), 1);
 }

@@ -4978,7 +4978,7 @@ fn mutation_authorization_404_rejects_explicit_loopback() {
 
     mutation_authorization_publish_project()
         .cargo("publish --no-verify --registry alternative")
-        .arg("--mutation-authorization-channel=loopback")
+        .arg("--mutation-authorization-mode=loopback")
         .with_status(101)
         .with_stderr_contains("[..]cannot activate the `loopback-callback` extension[..]")
         .run();
@@ -5224,6 +5224,54 @@ fn mutation_authorization_core_does_not_retry_final_request() {
     assert_eq!(*publish_count2.lock().unwrap(), 1);
 }
 
+/// `idempotent-final` permits one bounded retry after a transient final response.
+#[cargo_test]
+fn mutation_authorization_idempotent_final_retries_503() {
+    let publish_count = Arc::new(Mutex::new(0u32));
+    let publish_count2 = publish_count.clone();
+    let _registry = RegistryBuilder::new()
+        .alternative()
+        .http_api()
+        .add_responder("/api/v1/auth/mutation-challenges", |_req, _server| Response {
+            code: 200,
+            headers: vec!["Cache-Control: no-store".into()],
+            body: br#"{"status":"ready","protocol_version":1,"active_extensions":["idempotent-final"],"mutation_id":"mut_retry_503_0123456789012","grant_expires_in":300,"receive_lease_secs":1800}"#.to_vec(),
+        })
+        .add_responder("/api/v1/crates/new", move |req, server| {
+            let mut count = publish_count.lock().unwrap();
+            *count += 1;
+            if *count == 1 {
+                Response {
+                    code: 503,
+                    headers: vec!["Retry-After: 0".into()],
+                    body: br#"{"errors":[{"detail":"temporarily unavailable"}]}"#.to_vec(),
+                }
+            } else {
+                server.check_authorized_publish(req)
+            }
+        })
+        .build();
+
+    let p = project()
+        .file(
+            "Cargo.toml",
+            r#"
+                [package]
+                name = "foo"
+                version = "0.0.1"
+                edition = "2015"
+                authors = []
+                license = "MIT"
+                description = "foo"
+            "#,
+        )
+        .file("src/lib.rs", "")
+        .build();
+
+    p.cargo("publish --no-verify --registry alternative").run();
+    assert_eq!(*publish_count2.lock().unwrap(), 2);
+}
+
 /// Explicit loopback selection fails closed unless the preflight activates it.
 #[cargo_test]
 fn mutation_authorization_core_rejects_explicit_loopback() {
@@ -5253,7 +5301,7 @@ fn mutation_authorization_core_rejects_explicit_loopback() {
         .build();
 
     p.cargo("publish --no-verify --registry alternative")
-        .arg("--mutation-authorization-channel=loopback")
+        .arg("--mutation-authorization-mode=loopback")
         .with_status(101)
         .with_stderr_contains(
             "[..]registry did not activate the `loopback-callback` authorization extension[..]",
@@ -5293,7 +5341,7 @@ fn mutation_authorization_closes_loopback_before_final_request() {
 
     mutation_authorization_publish_project()
         .cargo("publish --no-verify --registry alternative")
-        .arg("--mutation-authorization-channel=loopback")
+        .arg("--mutation-authorization-mode=loopback")
         .run();
 }
 
@@ -5387,7 +5435,7 @@ fn mutation_authorization_rejects_oversized_poll_response_once() {
         .build();
 
     p.cargo("publish --no-verify --registry alternative")
-        .arg("--mutation-authorization-channel=poll")
+        .arg("--mutation-authorization-mode=poll")
         .with_status(101)
         .with_stderr_contains("[..]HTTP response body exceeded the 65536-byte limit[..]")
         .run();
@@ -5487,7 +5535,7 @@ fn mutation_authorization_rejects_poll_redirect() {
         .build();
 
     p.cargo("publish --no-verify --registry alternative")
-        .arg("--mutation-authorization-channel=poll")
+        .arg("--mutation-authorization-mode=poll")
         .with_status(101)
         .with_stderr_contains(
             "[..]refusing to follow mutation-authorization poll redirect from [..] to [..][..]",
@@ -5530,7 +5578,7 @@ fn mutation_authorization_rejects_cross_origin_poll_url() {
         .build();
 
     p.cargo("publish --no-verify --registry alternative")
-        .arg("--mutation-authorization-channel=poll")
+        .arg("--mutation-authorization-mode=poll")
         .with_status(101)
         .with_stderr_contains(
             "[..]mutation authorization poll_url must share the registry API origin[..]",
@@ -5585,7 +5633,7 @@ fn mutation_authorization_poll_not_found() {
         .build();
 
     p.cargo("publish --no-verify --registry alternative")
-        .arg("--mutation-authorization-channel=poll")
+        .arg("--mutation-authorization-mode=poll")
         .with_status(101)
         .with_stderr_contains("[..]mutation authorization record was not found[..]")
         .run();
@@ -5604,7 +5652,7 @@ fn mutation_authorization_fails_fast_when_noninteractive() {
             Response {
                 code: 403,
                 headers: vec!["Cache-Control: no-store".into()],
-                body: br#"{"status":"interaction_required","protocol_version":1,"active_extensions":[],"detail":"This operation requires registry authorization."}"#.to_vec(),
+                body: br#"{"status":"interaction_required","protocol_version":1,"active_extensions":[],"detail":"This operation requires registry authorization. Visit https://example.invalid/help."}"#.to_vec(),
             }
         })
         .build();
@@ -5631,9 +5679,12 @@ fn mutation_authorization_fails_fast_when_noninteractive() {
     p.cargo("publish --no-verify --registry alternative")
         .env("CI", "true")
         .with_status(101)
-        .with_stderr_contains("[..]This operation requires registry authorization.[..]")
+        .with_stderr_contains("[..]Instructions from registry http://127.0.0.1:[..]")
         .with_stderr_contains(
-            "[..]no authorization challenge was created; rerun with --mutation-authorization-channel=poll[..]",
+            "[..]This operation requires registry authorization. Visit [external URL: https://example.invalid/help].[..]",
+        )
+        .with_stderr_contains(
+            "[..]no authorization challenge was created; rerun with --mutation-authorization-mode=poll[..]",
         )
         .run();
 }
