@@ -225,13 +225,12 @@ pub fn publish(ws: &Workspace<'_>, opts: &PublishOpts<'_>) -> CargoResult<()> {
             let (pkg, (_features, tarball)) = &pkg_dep_graph.packages[&pkg_id];
             opts.gctx.shell().status("Uploading", pkg.package_id())?;
 
+            let ver = pkg.version().to_string();
+            tarball.file().seek(SeekFrom::Start(0))?;
+            let hash = cargo_util::Sha256::new()
+                .update_file(tarball.file())?
+                .finish_hex();
             if !opts.dry_run {
-                let ver = pkg.version().to_string();
-
-                tarball.file().seek(SeekFrom::Start(0))?;
-                let hash = cargo_util::Sha256::new()
-                    .update_file(tarball.file())?
-                    .finish_hex();
                 let operation = Operation::Publish {
                     name: pkg.name().as_str(),
                     vers: &ver,
@@ -267,6 +266,7 @@ pub fn publish(ws: &Workspace<'_>, opts: &PublishOpts<'_>) -> CargoResult<()> {
                 tarball.file(),
                 &mut registry,
                 source_ids.original,
+                &hash,
                 opts.reg_or_index.as_ref(),
                 opts.registry_authorization.as_deref(),
                 opts.dry_run,
@@ -656,6 +656,7 @@ fn transmit(
     tarball: &File,
     registry: &mut Registry<RegistryClient<'_>>,
     registry_id: SourceId,
+    checksum: &str,
     reg_or_index: Option<&RegistryOrIndex>,
     registry_authorization: Option<&str>,
     dry_run: bool,
@@ -689,12 +690,26 @@ fn transmit(
         &body,
         tarball_len,
     );
-    let warnings = super::step_up::with_step_up_retry(
+    let warnings = super::mutation_authorization::with_mutation_authorization(
         gctx,
         registry,
         reg_or_index,
         registry_authorization,
         descriptor,
+        || {
+            auth::auth_token(
+                gctx,
+                &registry_id,
+                None,
+                Operation::Publish {
+                    name: pkg.name().as_str(),
+                    vers: &pkg.version().to_string(),
+                    cksum: checksum,
+                },
+                vec![],
+                false,
+            )
+        },
         |registry| registry.publish_body(&body, tarball_len),
     )
     .with_context(|| {

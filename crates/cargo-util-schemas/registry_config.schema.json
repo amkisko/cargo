@@ -19,44 +19,9 @@
       "description": "Whether all operations require authentication. See [RFC 3139].\n\n[RFC 3139]: https://rust-lang.github.io/rfcs/3139-cargo-alternative-registry-auth.html",
       "type": "boolean",
       "default": false
-    },
-    "mutation-authorization": {
-      "description": "Registry mutation-authorization protocol capability.\n\nRegistries advertise after implementing the core mutation endpoints;\ncompanion guarantees are listed independently in `extensions`.",
-      "anyOf": [
-        {
-          "$ref": "#/$defs/MutationAuthorization"
-        },
-        {
-          "type": "null"
-        }
-      ]
     }
   },
   "required": [
     "dl"
-  ],
-  "$defs": {
-    "MutationAuthorization": {
-      "description": "Registry mutation-authorization capabilities advertised by `config.json`.",
-      "type": "object",
-      "properties": {
-        "version": {
-          "description": "Latest protocol version implemented by the registry.",
-          "type": "integer",
-          "format": "uint64",
-          "minimum": 0
-        },
-        "extensions": {
-          "description": "Independently specified protocol extensions implemented by the registry.",
-          "type": "array",
-          "items": {
-            "type": "string"
-          }
-        }
-      },
-      "required": [
-        "version"
-      ]
-    }
-  }
+  ]
 }

@@ -196,13 +196,12 @@ fn simple_remove_with_asymmetric() {
 
 /// Cargo binds an advertised owner change before sending it.
 #[cargo_test]
-fn step_up_required_then_retry() {
+fn mutation_authorization_required_then_retry() {
     let owner_count = Arc::new(Mutex::new(0u32));
     let poll_count = Arc::new(Mutex::new(0u32));
 
     let registry = RegistryBuilder::new()
         .http_api()
-        .step_up_auth()
         .add_responder(
             "/api/v1/auth/mutation-challenges",
             move |req, _server| {
@@ -212,7 +211,7 @@ fn step_up_required_then_retry() {
                 assert_eq!(descriptor["operation"], "owners");
                 assert_eq!(descriptor["content_type"], "application/json");
                 let body = format!(
-                    r#"{{"status":"pending","detail":"Authorize this owner change.","protocol_version":1,"mutation_id":"mut_owners_01234567890123","poll_url":"{origin}/api/v1/auth/mutation-challenges/poll/poll_owners_01234567","challenge_expires_in":300,"recommended_poll_interval_secs":1}}"#
+                    r#"{{"status":"pending","detail":"Authorize this owner change.","protocol_version":1,"active_extensions":["idempotent-final"],"mutation_id":"mut_owners_01234567890123","poll_url":"{origin}/api/v1/auth/mutation-challenges/poll/poll_owners_01234567","challenge_expires_in":300,"recommended_poll_interval_secs":1}}"#
                 );
                 Response {
                     code: 202,
@@ -239,7 +238,7 @@ fn step_up_required_then_retry() {
             Response {
                 code: 200,
                 headers: vec!["Cache-Control: no-store".into()],
-                body: br#"{"status":"ready","grant_expires_in":300}"#.to_vec(),
+                body: br#"{"status":"ready","grant_expires_in":300,"receive_lease_secs":1800}"#.to_vec(),
             }
         })
         .build();

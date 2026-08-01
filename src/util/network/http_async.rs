@@ -148,14 +148,22 @@ impl Client {
         follow_redirects: bool,
     ) -> HttpResult<Easy2<Collector>> {
         let url = request.uri().to_string();
-        debug!(target: "network::fetch", url);
         let mut collector = Collector::new(self.stats.clone());
         let (parts, body) = request.into_parts();
+        let sensitive = parts
+            .extensions
+            .get::<crates_io::SensitiveRequest>()
+            .is_some();
+        if sensitive {
+            debug!(target: "network::fetch", url = "[REDACTED]");
+        } else {
+            debug!(target: "network::fetch", url);
+        }
         collector.response_body_limit = parts
             .extensions
             .get::<crates_io::ResponseBodyLimit>()
             .map(|limit| limit.0);
-        collector.redact_debug_data = has_sensitive_step_up_headers(&parts.headers);
+        collector.redact_debug_data = sensitive;
         let body_len = body.len();
         collector.request_body = Cursor::new(body);
         collector.debug = self.handle_config.verbose;
@@ -209,11 +217,6 @@ impl Client {
             .try_into()
             .unwrap()
     }
-}
-
-fn has_sensitive_step_up_headers(headers: &http::HeaderMap) -> bool {
-    headers.contains_key("cargo-step-up-callback-secret")
-        || headers.contains_key("cargo-step-up-proof")
 }
 
 impl Drop for Client {
@@ -467,7 +470,7 @@ struct Collector {
     request_body: Cursor<Vec<u8>>,
     /// Whether we're in debug mode
     debug: bool,
-    /// Whether this transfer carries step-up credentials that could be reflected.
+    /// Whether this transfer contains protocol capabilities that must not be traced.
     redact_debug_data: bool,
     /// Maximum response body accepted for this request, if any.
     response_body_limit: Option<usize>,
@@ -624,26 +627,7 @@ mod tests {
 
     use curl::easy::Handler;
 
-    use super::{Collector, Stats, has_sensitive_step_up_headers};
-
-    #[test]
-    fn step_up_credentials_mark_http_trace_as_sensitive() {
-        let mut headers = http::HeaderMap::new();
-        assert!(!has_sensitive_step_up_headers(&headers));
-
-        headers.insert(
-            "Cargo-Step-Up-Callback-Secret",
-            http::HeaderValue::from_static("secret"),
-        );
-        assert!(has_sensitive_step_up_headers(&headers));
-
-        headers.remove("Cargo-Step-Up-Callback-Secret");
-        headers.insert(
-            "Cargo-Step-Up-Proof",
-            http::HeaderValue::from_static("proof"),
-        );
-        assert!(has_sensitive_step_up_headers(&headers));
-    }
+    use super::{Collector, Stats};
 
     #[test]
     fn response_body_limit_stops_collection_during_receipt() {

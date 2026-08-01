@@ -9,7 +9,7 @@ mod cargo_owner;
 mod cargo_publish;
 mod cargo_search;
 mod cargo_yank;
-mod step_up;
+mod mutation_authorization;
 
 use crate::util::data_structures::HashSet;
 use std::str;
@@ -164,15 +164,7 @@ fn registry<'gctx>(
         None
     };
     let handle = RegistryClient(gctx.http_async()?);
-    let mut registry = Registry::new_handle(api_host, token, handle, cfg.auth_required);
-    if let Some(capabilities) = cfg.mutation_authorization {
-        let distinct_extensions: std::collections::HashSet<_> =
-            capabilities.extensions.iter().collect();
-        if capabilities.version == 0 || distinct_extensions.len() != capabilities.extensions.len() {
-            bail!("registry has an invalid `mutation-authorization` capability envelope");
-        }
-        registry.set_mutation_authorization(capabilities.version, capabilities.extensions);
-    }
+    let registry = Registry::new_handle(api_host, token, handle, cfg.auth_required);
     Ok((registry, src))
 }
 

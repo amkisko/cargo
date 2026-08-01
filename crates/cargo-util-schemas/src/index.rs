@@ -292,24 +292,6 @@ pub struct RegistryConfig {
     /// [RFC 3139]: https://rust-lang.github.io/rfcs/3139-cargo-alternative-registry-auth.html
     #[serde(default)]
     pub auth_required: bool,
-
-    /// Registry mutation-authorization protocol capability.
-    ///
-    /// Registries advertise after implementing the core mutation endpoints;
-    /// companion guarantees are listed independently in `extensions`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub mutation_authorization: Option<MutationAuthorization>,
-}
-
-/// Registry mutation-authorization capabilities advertised by `config.json`.
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[cfg_attr(feature = "unstable-schema", derive(schemars::JsonSchema))]
-pub struct MutationAuthorization {
-    /// Latest protocol version implemented by the registry.
-    pub version: u64,
-    /// Independently specified protocol extensions implemented by the registry.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub extensions: Vec<String>,
 }
 
 impl RegistryConfig {

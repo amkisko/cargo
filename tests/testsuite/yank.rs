@@ -284,13 +284,12 @@ Caused by:
 
 /// Core-only mutation authorization polls until ready, then sends the yank once.
 #[cargo_test]
-fn step_up_required_then_retry() {
+fn mutation_authorization_required_then_retry() {
     let yank_count = Arc::new(Mutex::new(0u32));
     let poll_count = Arc::new(Mutex::new(0u32));
 
     let registry = RegistryBuilder::new()
         .http_api()
-        .step_up_auth_core()
         .add_responder(
             "/api/v1/auth/mutation-challenges",
             move |req, _server| {
@@ -299,11 +298,14 @@ fn step_up_required_then_retry() {
                     serde_json::from_slice(req.body.as_deref().unwrap()).unwrap();
                 assert_eq!(descriptor["operation"], "yank");
                 assert_eq!(descriptor["allow_pending"], true);
-                assert!(descriptor.get("method").is_none());
-                assert!(descriptor.get("request_target").is_none());
-                assert!(descriptor.get("content_type").is_none());
+                assert_eq!(descriptor["method"], "DELETE");
+                assert_eq!(
+                    descriptor["request_target"],
+                    "/api/v1/crates/foo/0.0.1/yank"
+                );
+                assert!(descriptor["content_type"].is_null());
                 let body = format!(
-                    r#"{{"status":"pending","detail":"Authorize this yank at {origin}/verify/mut_yank.","protocol_version":1,"mutation_id":"mut_yank_0123456789012345","poll_url":"{origin}/api/v1/auth/mutation-challenges/poll/poll_yank_0123456789","challenge_expires_in":300,"recommended_poll_interval_secs":1}}"#
+                    r#"{{"status":"pending","detail":"Authorize this yank at {origin}/verify/mut_yank.","protocol_version":1,"active_extensions":[],"mutation_id":"mut_yank_0123456789012345","poll_url":"{origin}/api/v1/auth/mutation-challenges/poll/poll_yank_0123456789","challenge_expires_in":300,"recommended_poll_interval_secs":1}}"#
                 );
                 Response {
                     code: 202,

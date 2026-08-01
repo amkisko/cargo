@@ -10,6 +10,7 @@ use crate::CargoResult;
 use crate::GlobalContext;
 use crate::drop_print;
 use crate::drop_println;
+use crate::util::auth;
 use crate::util::important_paths::find_root_manifest_for_wd;
 use crate::workspace::Workspace;
 
@@ -49,12 +50,22 @@ pub fn modify_owners(gctx: &GlobalContext, opts: &OwnersOptions) -> CargoResult<
     if let Some(ref v) = opts.to_add {
         let v = v.iter().map(|s| &s[..]).collect::<Vec<_>>();
         let descriptor = crates_io::MutationDescriptor::owners(&name, &v, true)?;
-        let msg = super::step_up::with_step_up_retry(
+        let msg = super::mutation_authorization::with_mutation_authorization(
             gctx,
             &mut registry,
             opts.reg_or_index.as_ref(),
             opts.registry_authorization.as_deref(),
             descriptor,
+            || {
+                auth::auth_token(
+                    gctx,
+                    &source_ids.original,
+                    None,
+                    Operation::Owners { name: &name },
+                    vec![],
+                    false,
+                )
+            },
             |registry| registry.add_owners(&name, &v),
         )
         .with_context(|| {
@@ -73,12 +84,22 @@ pub fn modify_owners(gctx: &GlobalContext, opts: &OwnersOptions) -> CargoResult<
         gctx.shell()
             .status("Owner", format!("removing {:?} from crate {}", v, name))?;
         let descriptor = crates_io::MutationDescriptor::owners(&name, &v, false)?;
-        super::step_up::with_step_up_retry(
+        super::mutation_authorization::with_mutation_authorization(
             gctx,
             &mut registry,
             opts.reg_or_index.as_ref(),
             opts.registry_authorization.as_deref(),
             descriptor,
+            || {
+                auth::auth_token(
+                    gctx,
+                    &source_ids.original,
+                    None,
+                    Operation::Owners { name: &name },
+                    vec![],
+                    false,
+                )
+            },
             |registry| registry.remove_owners(&name, &v),
         )
         .with_context(|| {

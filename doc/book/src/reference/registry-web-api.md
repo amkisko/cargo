@@ -35,31 +35,30 @@ detailed or user-centric error message.
 ### Mutation authorization
 
 A registry can require additional authorization for publish, yank, unyank, and
-owner changes. It advertises its implementation capability in index
-`config.json`; per-user and per-credential policy is evaluated by preflight:
-
-```json
-{
-    "mutation-authorization": {
-        "version": 1,
-        "extensions": ["idempotent-final", "loopback-callback"]
-    }
-}
-```
+owner changes. Cargo discovers support through authenticated preflight; index
+`config.json` contains no mutation-authorization capability.
 
 For a version 1 mutation, Cargo first sends an authenticated `POST` to
 `/api/v1/auth/mutation-challenges`. The JSON body contains protocol version 1,
-a fresh `preflight_id`, `allow_pending`, and an exact mutation descriptor. The
-core descriptor binds the raw body SHA-256 and size and the operation-specific
-crate, version, owner, and archive facts. `idempotent-final` additionally binds
+a fresh `preflight_id`, `allow_pending`, `requested_extensions`, and an exact
+mutation descriptor. The core descriptor binds the raw body SHA-256 and size
+and the operation-specific crate, version, owner, and archive facts.
+`idempotent-final` additionally binds
 the method, request target, and normalized content type. A callback-capable
 client can also register the exact loopback URL
 `http://127.0.0.1:{port}/cargo/registry-authorization?state={random}`.
 
-A `200 OK` response with `status: "ready"` provides a `mutation_id` and
-`grant_expires_in`. A `202 Accepted` response with `status: "pending"` provides
-complete plain-text `detail`, that mutation id, an independent same-origin
-`poll_url`, and `challenge_expires_in`. When `allow_pending` is false and
+A definitive `404 Not Found` from this endpoint means the registry does not
+implement mutation authorization, so Cargo sends the ordinary mutation. Cargo
+does not fall back after transport errors, other statuses, or malformed
+responses. The registry activates any supported subset of requested extensions
+and returns it in `active_extensions`; Cargo relies only on that echoed set.
+
+A `200 OK` response with `status: "ready"` provides a `mutation_id`, the
+`active_extensions`, and `grant_expires_in`. A `202 Accepted` response with
+`status: "pending"` provides complete plain-text `detail`, that mutation id, an
+independent same-origin `poll_url`, and `challenge_expires_in`. When
+`allow_pending` is false and
 authorization would require waiting, the registry returns
 `interaction_required` with `403 Forbidden` and creates no record.
 Cargo renders `detail` as bounded inert text, neutralizes terminal controls,
@@ -67,14 +66,14 @@ attributes it to the registry origin, and keeps essential wait output visible
 under `--quiet`.
 
 Cargo polls without its primary credential. Poll status is `pending`, `ready`,
-`denied`, or `expired`. When `loopback-callback` is advertised, Cargo registers
+`denied`, or `expired`. When `loopback-callback` is activated, Cargo registers
 a loopback URL containing client-generated `state`. Loading that URL causes an
 immediate poll; it is never proof of authorization. Human-readable verification
 instructions remain entirely in `detail`.
 
 After `ready`, Cargo obtains an ordinary primary credential and sends the
 original mutation with `Cargo-Mutation-Id`. The registry checks its credential
-binding and exact descriptor. When `idempotent-final` is advertised, Cargo may
+binding and exact descriptor. When `idempotent-final` is activated, Cargo may
 retry ambiguous or transient final requests; the registry executes the logical
 mutation at most once and replays its retained terminal response. Preflight
 never stages an upload or reserves a version.

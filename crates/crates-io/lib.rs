@@ -15,10 +15,12 @@ use url::Url;
 
 type RegistryResult<T, E> = Result<T, Error<E>>;
 
-/// Maximum UTF-8 byte length of step-up instructions in protocol version 1.
-pub const STEP_UP_DETAIL_MAX_BYTES: usize = 8 * 1024;
-/// Maximum response-body size accepted for a step-up preflight or poll.
-pub const STEP_UP_RESPONSE_MAX_BYTES: usize = 64 * 1024;
+/// Maximum UTF-8 byte length of mutation-authorization instructions.
+pub const MUTATION_AUTHORIZATION_DETAIL_MAX_BYTES: usize = 8 * 1024;
+/// Maximum response-body size accepted for a mutation-authorization preflight or poll.
+pub const MUTATION_AUTHORIZATION_RESPONSE_MAX_BYTES: usize = 64 * 1024;
+/// Maximum response body accepted from a mutation endpoint while authorization is active.
+pub const MUTATION_RESPONSE_MAX_BYTES: usize = 1024 * 1024;
 
 /// Request extension asking an HTTP client to stop receiving after this many bytes.
 ///
@@ -26,6 +28,14 @@ pub const STEP_UP_RESPONSE_MAX_BYTES: usize = 64 * 1024;
 /// checks the completed response, while Cargo's client enforces it during receipt.
 #[derive(Clone, Copy, Debug)]
 pub struct ResponseBodyLimit(pub usize);
+
+/// Marks a request whose URL, body, or response must not appear in HTTP traces.
+///
+/// Mutation-authorization requests can contain poll capabilities or loopback
+/// state. Clients that support verbose transfer logging should suppress the
+/// complete trace for requests carrying this extension.
+#[derive(Clone, Copy, Debug)]
+pub struct SensitiveRequest;
 
 /// Perform an HTTP request and return the response.
 ///
@@ -37,7 +47,7 @@ pub trait HttpClient {
 
     /// Like [`Self::request`], but HTTP redirects must not be followed.
     ///
-    /// Used for step-up challenge polls so a same-origin `poll_url` cannot redirect
+    /// Used for mutation-authorization polls so a same-origin `poll_url` cannot redirect
     /// the client to loopback or other internal addresses.
     ///
     /// Implementations must perform the request with redirect following disabled.
@@ -54,12 +64,6 @@ pub struct Registry<T: HttpClient> {
     handle: T,
     /// Whether to include the authorization token with all requests.
     auth_required: bool,
-    /// Selected mutation-authorization protocol version.
-    mutation_authorization_version: Option<u64>,
-    /// Whether the registry advertised a mutation-authorization envelope.
-    mutation_authorization_advertised: bool,
-    /// Independently specified mutation-authorization extensions.
-    mutation_authorization_extensions: Vec<String>,
     /// Extra headers for the final idempotent mutation request.
     mutation_headers: MutationHeaders,
     /// Optional bound for API response bodies while recognizing a reactive challenge.
@@ -230,6 +234,7 @@ struct MutationPreflight<'a> {
     protocol_version: u64,
     preflight_id: &'a str,
     allow_pending: bool,
+    requested_extensions: &'a [&'a str],
     #[serde(flatten)]
     descriptor: CoreMutationDescriptor<'a>,
     #[serde(flatten, skip_serializing_if = "Option::is_none")]
@@ -243,6 +248,7 @@ struct MutationPreflight<'a> {
 pub struct MutationAuthorizationResponse {
     pub status: String,
     pub protocol_version: u64,
+    pub active_extensions: Vec<String>,
     #[serde(default)]
     pub mutation_id: Option<String>,
     #[serde(default)]
@@ -259,6 +265,8 @@ pub struct MutationAuthorizationResponse {
     pub challenge_expires_in: Option<u64>,
     #[serde(default)]
     pub grant_expires_in: Option<u64>,
+    #[serde(default)]
+    pub receive_lease_secs: Option<u64>,
     #[serde(default)]
     pub recommended_poll_interval_secs: Option<u64>,
 }
@@ -367,6 +375,8 @@ pub struct MutationAuthorizationStatus {
     #[serde(default)]
     pub grant_expires_in: Option<u64>,
     #[serde(default)]
+    pub receive_lease_secs: Option<u64>,
+    #[serde(default)]
     pub recommended_poll_interval_secs: Option<u64>,
 }
 #[derive(Serialize)]
@@ -424,37 +434,37 @@ pub enum Error<T> {
         errors: Vec<String>,
     },
 
-    /// `poll_url` from a step-up challenge did not share the registry API origin.
+    /// A mutation-authorization `poll_url` did not share the registry API origin.
     ///
     /// Cargo refuses to follow cross-origin poll URLs to avoid SSRF from a
     /// malicious registry response.
     #[error(
-        "refusing to poll step-up status at `{poll_url}`; \
+        "refusing to poll mutation-authorization status at `{poll_url}`; \
          URL must use the same origin as the registry API ({registry_host})"
     )]
-    InvalidStepUpPollUrl {
+    InvalidMutationAuthorizationPollUrl {
         poll_url: String,
         registry_host: String,
     },
 
-    /// Step-up poll responded with an HTTP redirect.
+    /// A mutation-authorization poll responded with an HTTP redirect.
     ///
     /// Poll requests do not follow redirects so a malicious registry cannot
     /// bounce the client onto loopback or link-local addresses after the
     /// same-origin check passes.
-    #[error("refusing to follow step-up poll redirect from `{poll_url}`")]
-    InvalidStepUpPollRedirect {
+    #[error("refusing to follow mutation-authorization poll redirect from `{poll_url}`")]
+    InvalidMutationAuthorizationPollRedirect {
         poll_url: String,
         location: Option<String>,
     },
 
-    /// A bounded step-up response exceeded the protocol implementation limit.
-    #[error("registry step-up response exceeded the {limit}-byte limit")]
-    StepUpResponseTooLarge { limit: usize },
+    /// A bounded mutation-authorization response exceeded the implementation limit.
+    #[error("registry mutation-authorization response exceeded the {limit}-byte limit")]
+    MutationAuthorizationResponseTooLarge { limit: usize },
 
-    /// A structured step-up challenge contained invalid instructions.
-    #[error("invalid registry step-up challenge: {0}")]
-    InvalidStepUpChallenge(String),
+    /// A structured mutation-authorization response was invalid.
+    #[error("invalid registry mutation-authorization response: {0}")]
+    InvalidMutationAuthorizationResponse(String),
 
     /// Error from API response which didn't have pre-programmed `errors.details`.
     #[error(
@@ -511,38 +521,9 @@ impl<T: HttpClient> Registry<T> {
             token,
             handle,
             auth_required,
-            mutation_authorization_version: None,
-            mutation_authorization_advertised: false,
-            mutation_authorization_extensions: Vec::new(),
             mutation_headers: MutationHeaders::default(),
             response_body_limit: None,
         }
-    }
-
-    /// Sets mutation-authorization capabilities advertised by registry `config.json`.
-    pub fn set_mutation_authorization(&mut self, version: u64, extensions: Vec<String>) {
-        self.mutation_authorization_advertised = true;
-        self.mutation_authorization_version = (version == 1).then_some(version);
-        self.mutation_authorization_extensions = extensions;
-    }
-
-    /// Whether the registry advertised an independently specified extension.
-    pub fn supports_mutation_authorization_extension(&self, extension: &str) -> bool {
-        self.mutation_authorization_version == Some(1)
-            && self
-                .mutation_authorization_extensions
-                .iter()
-                .any(|advertised| advertised == extension)
-    }
-
-    /// Whether this registry advertises mutation authorization version 1.
-    pub fn supports_mutation_authorization(&self) -> bool {
-        self.mutation_authorization_version == Some(1)
-    }
-
-    /// Whether mutation authorization is advertised at an unsupported version.
-    pub fn mutation_authorization_version_unsupported(&self) -> bool {
-        self.mutation_authorization_advertised && self.mutation_authorization_version.is_none()
     }
 
     pub fn set_token(&mut self, token: Option<String>) {
@@ -554,7 +535,7 @@ impl<T: HttpClient> Registry<T> {
         self.mutation_headers = headers;
     }
 
-    /// Clears step-up headers after a successful mutate or when abandoning a handshake.
+    /// Clears mutation headers after success or when abandoning authorization.
     pub fn clear_mutation_headers(&mut self) {
         self.mutation_headers = MutationHeaders::default();
     }
@@ -570,22 +551,24 @@ impl<T: HttpClient> Registry<T> {
         descriptor: &MutationDescriptor,
         preflight_id: &str,
         allow_pending: bool,
-        idempotent_final: bool,
+        requested_extensions: &[&str],
         callback: Option<&MutationCallback>,
-    ) -> RegistryResult<(StatusCode, MutationAuthorizationResponse), T::Error> {
-        let idempotent = if idempotent_final {
+    ) -> RegistryResult<Option<(StatusCode, MutationAuthorizationResponse)>, T::Error> {
+        let idempotent = if requested_extensions.contains(&"idempotent-final") {
             let endpoint = descriptor
                 .request_target
                 .strip_prefix("/api/v1")
                 .ok_or_else(|| {
-                    Error::InvalidStepUpChallenge(
+                    Error::InvalidMutationAuthorizationResponse(
                         "mutation request_target did not use the registry API path".to_owned(),
                     )
                 })?;
             Some(IdempotentMutationDescriptor {
                 method: &descriptor.method,
                 request_target: Url::parse(&self.api_url(endpoint))
-                    .map_err(|error| Error::InvalidStepUpChallenge(error.to_string()))?
+                    .map_err(|error| {
+                        Error::InvalidMutationAuthorizationResponse(error.to_string())
+                    })?
                     .path()
                     .to_owned(),
                 content_type: descriptor.content_type.as_deref(),
@@ -597,6 +580,7 @@ impl<T: HttpClient> Registry<T> {
             protocol_version: 1,
             preflight_id,
             allow_pending,
+            requested_extensions,
             descriptor: descriptor.into(),
             idempotent,
             callback,
@@ -611,14 +595,15 @@ impl<T: HttpClient> Registry<T> {
         let mut request = request.body(body)?;
         request
             .extensions_mut()
-            .insert(ResponseBodyLimit(STEP_UP_RESPONSE_MAX_BYTES));
+            .insert(ResponseBodyLimit(MUTATION_AUTHORIZATION_RESPONSE_MAX_BYTES));
+        request.extensions_mut().insert(SensitiveRequest);
         let response = self
             .handle
             .request_no_redirect(request)
             .map_err(Error::Transport)?;
-        if response.body().len() > STEP_UP_RESPONSE_MAX_BYTES {
-            return Err(Error::StepUpResponseTooLarge {
-                limit: STEP_UP_RESPONSE_MAX_BYTES,
+        if response.body().len() > MUTATION_AUTHORIZATION_RESPONSE_MAX_BYTES {
+            return Err(Error::MutationAuthorizationResponseTooLarge {
+                limit: MUTATION_AUTHORIZATION_RESPONSE_MAX_BYTES,
             });
         }
         if response.status().is_redirection() {
@@ -627,13 +612,16 @@ impl<T: HttpClient> Registry<T> {
                 .get(http::header::LOCATION)
                 .and_then(|value| value.to_str().ok())
                 .map(str::to_owned);
-            return Err(Error::InvalidStepUpPollRedirect {
+            return Err(Error::InvalidMutationAuthorizationPollRedirect {
                 poll_url: self.api_url("/auth/mutation-challenges"),
                 location,
             });
         }
+        if response.status() == StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
         if !has_no_store(response.headers()) {
-            return Err(Error::InvalidStepUpChallenge(
+            return Err(Error::InvalidMutationAuthorizationResponse(
                 "preflight response must include Cache-Control: no-store".to_owned(),
             ));
         }
@@ -643,14 +631,14 @@ impl<T: HttpClient> Registry<T> {
             StatusCode::OK | StatusCode::ACCEPTED | StatusCode::FORBIDDEN
         ) {
             return self.handle(response).and_then(|_| {
-                Err(Error::InvalidStepUpChallenge(
+                Err(Error::InvalidMutationAuthorizationResponse(
                     "preflight returned an invalid HTTP status".to_owned(),
                 ))
             });
         }
         let body = String::from_utf8(response.into_body())?;
         let response = serde_json::from_str(&body)?;
-        Ok((status, response))
+        Ok(Some((status, response)))
     }
 
     fn token(&self) -> RegistryResult<&str, T::Error> {
@@ -688,7 +676,7 @@ impl<T: HttpClient> Registry<T> {
 
     /// Builds the `/crates/new` request body (crate metadata + tarball).
     ///
-    /// Callers that may retry the upload (for example after a step-up handshake)
+    /// Callers that may retry the upload after mutation authorization
     /// should build the body once and pass it to [`Self::publish_body`].
     pub fn prepare_publish_body(
         krate: &NewCrate,
@@ -729,7 +717,7 @@ impl<T: HttpClient> Registry<T> {
     ) -> RegistryResult<Warnings, T::Error> {
         let url = self.api_url("/crates/new");
 
-        let request = self
+        let mut request = self
             .apply_mutation_headers(
                 http::Request::put(url)
                     .header(http::header::CONTENT_TYPE, "application/octet-stream")
@@ -738,8 +726,16 @@ impl<T: HttpClient> Registry<T> {
                     .header(http::header::AUTHORIZATION, self.token()?),
             )
             .body(body.to_vec())?;
+        if let Some(limit) = self.response_body_limit {
+            request.extensions_mut().insert(ResponseBodyLimit(limit));
+        }
         let started = Instant::now();
         let response = self.handle.request(request).map_err(Error::Transport)?;
+        if let Some(limit) = self.response_body_limit
+            && response.body().len() > limit
+        {
+            return Err(Error::MutationAuthorizationResponseTooLarge { limit });
+        }
         let body = self.handle(response).map_err(|e| match e {
             Error::Code { code, .. }
                 if code == StatusCode::SERVICE_UNAVAILABLE
@@ -823,7 +819,7 @@ impl<T: HttpClient> Registry<T> {
         Ok(())
     }
 
-    /// Polls a step-up challenge status endpoint.
+    /// Polls a mutation-authorization status endpoint.
     ///
     /// `poll_url` must share scheme/host/port with [`Registry::host`]. Redirects
     /// are not followed.
@@ -832,7 +828,7 @@ impl<T: HttpClient> Registry<T> {
         poll_url: &str,
     ) -> RegistryResult<MutationAuthorizationStatus, T::Error> {
         if !url_shares_origin_with_registry(poll_url, &self.host) {
-            return Err(Error::InvalidStepUpPollUrl {
+            return Err(Error::InvalidMutationAuthorizationPollUrl {
                 poll_url: poll_url.to_owned(),
                 registry_host: self.host.clone(),
             });
@@ -845,15 +841,16 @@ impl<T: HttpClient> Registry<T> {
         let mut request = request.body(Vec::new())?;
         request
             .extensions_mut()
-            .insert(ResponseBodyLimit(STEP_UP_RESPONSE_MAX_BYTES));
+            .insert(ResponseBodyLimit(MUTATION_AUTHORIZATION_RESPONSE_MAX_BYTES));
+        request.extensions_mut().insert(SensitiveRequest);
         let response = self
             .handle
             .request_no_redirect(request)
             .map_err(Error::Transport)?;
 
-        if response.body().len() > STEP_UP_RESPONSE_MAX_BYTES {
-            return Err(Error::StepUpResponseTooLarge {
-                limit: STEP_UP_RESPONSE_MAX_BYTES,
+        if response.body().len() > MUTATION_AUTHORIZATION_RESPONSE_MAX_BYTES {
+            return Err(Error::MutationAuthorizationResponseTooLarge {
+                limit: MUTATION_AUTHORIZATION_RESPONSE_MAX_BYTES,
             });
         }
 
@@ -863,13 +860,13 @@ impl<T: HttpClient> Registry<T> {
                 .get(http::header::LOCATION)
                 .and_then(|value| value.to_str().ok())
                 .map(str::to_owned);
-            return Err(Error::InvalidStepUpPollRedirect {
+            return Err(Error::InvalidMutationAuthorizationPollRedirect {
                 poll_url: poll_url.to_owned(),
                 location,
             });
         }
         if !has_no_store(response.headers()) {
-            return Err(Error::InvalidStepUpChallenge(
+            return Err(Error::InvalidMutationAuthorizationResponse(
                 "poll response must include Cache-Control: no-store".to_owned(),
             ));
         }
@@ -941,7 +938,7 @@ impl<T: HttpClient> Registry<T> {
         if let Some(limit) = response_body_limit
             && response.body().len() > limit
         {
-            return Err(Error::StepUpResponseTooLarge { limit });
+            return Err(Error::MutationAuthorizationResponseTooLarge { limit });
         }
         self.handle(response)
     }
@@ -1098,7 +1095,7 @@ mod tests {
     }
 
     #[test]
-    fn step_up_poll_url_same_origin() {
+    fn mutation_authorization_poll_url_same_origin() {
         assert!(url_shares_origin_with_registry(
             "https://crates.io/api/v1/auth/challenges/stp_x",
             "https://crates.io",
@@ -1110,7 +1107,7 @@ mod tests {
     }
 
     #[test]
-    fn step_up_poll_url_rejects_cross_origin() {
+    fn mutation_authorization_poll_url_rejects_cross_origin() {
         assert!(!url_shares_origin_with_registry(
             "http://127.0.0.1:9/secret",
             "https://crates.io",
@@ -1177,7 +1174,13 @@ mod tests {
         let descriptor = MutationDescriptor::yank("demo", "1.2.3", false);
 
         registry
-            .preflight_mutation(&descriptor, "pf_0123456789abcdefghijkl", false, true, None)
+            .preflight_mutation(
+                &descriptor,
+                "pf_0123456789abcdefghijkl",
+                false,
+                &["idempotent-final"],
+                None,
+            )
             .unwrap();
 
         let request = request.borrow();

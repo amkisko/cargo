@@ -4914,9 +4914,145 @@ fn workspace_circular_publish_dependency_with_non_cycle_package() {
         .run();
 }
 
+/// Builds the minimal package used by mutation-authorization transport tests.
+fn mutation_authorization_publish_project() -> Project {
+    project()
+        .file(
+            "Cargo.toml",
+            r#"
+                [package]
+                name = "foo"
+                version = "0.0.1"
+                edition = "2015"
+                authors = []
+                license = "MIT"
+                description = "foo"
+            "#,
+        )
+        .file("src/lib.rs", "")
+        .build()
+}
+
+/// A definitive missing preflight endpoint preserves ordinary registry behavior.
+#[cargo_test]
+fn mutation_authorization_404_falls_back() {
+    let publish_count = Arc::new(Mutex::new(0u32));
+    let publish_count2 = publish_count.clone();
+    let _registry = RegistryBuilder::new()
+        .alternative()
+        .http_api()
+        .add_responder("/api/v1/auth/mutation-challenges", |_req, _server| {
+            Response {
+                code: 404,
+                headers: vec![],
+                body: Vec::new(),
+            }
+        })
+        .add_responder("/api/v1/crates/new", move |req, server| {
+            *publish_count.lock().unwrap() += 1;
+            assert!(req.cargo_mutation_id.is_none());
+            server.check_authorized_publish(req)
+        })
+        .build();
+
+    mutation_authorization_publish_project()
+        .cargo("publish --no-verify --registry alternative")
+        .run();
+    assert_eq!(*publish_count2.lock().unwrap(), 1);
+}
+
+/// Explicit loopback mode requires a registry that can activate its extension.
+#[cargo_test]
+fn mutation_authorization_404_rejects_explicit_loopback() {
+    let _registry = RegistryBuilder::new()
+        .alternative()
+        .http_api()
+        .add_responder("/api/v1/auth/mutation-challenges", |_req, _server| {
+            Response {
+                code: 404,
+                headers: vec![],
+                body: Vec::new(),
+            }
+        })
+        .build();
+
+    mutation_authorization_publish_project()
+        .cargo("publish --no-verify --registry alternative")
+        .arg("--registry-authorization=loopback")
+        .with_status(101)
+        .with_stderr_contains("[..]cannot activate the `loopback-callback` extension[..]")
+        .run();
+}
+
+/// Server failures cannot downgrade mutation authorization to an ordinary request.
+#[cargo_test]
+fn mutation_authorization_server_error_fails_closed() {
+    let publish_count = Arc::new(Mutex::new(0u32));
+    let publish_count2 = publish_count.clone();
+    let _registry = RegistryBuilder::new()
+        .alternative()
+        .http_api()
+        .add_responder("/api/v1/auth/mutation-challenges", |_req, _server| {
+            Response {
+                code: 503,
+                headers: vec!["Cache-Control: no-store".into()],
+                body: br#"{"errors":[{"detail":"preflight unavailable"}]}"#.to_vec(),
+            }
+        })
+        .add_responder("/api/v1/crates/new", move |_req, _server| {
+            *publish_count.lock().unwrap() += 1;
+            Response {
+                code: 200,
+                headers: vec![],
+                body: Vec::new(),
+            }
+        })
+        .build();
+
+    mutation_authorization_publish_project()
+        .cargo("publish --no-verify --registry alternative")
+        .with_status(101)
+        .with_stderr_contains("[..]preflight unavailable[..]")
+        .run();
+    assert_eq!(*publish_count2.lock().unwrap(), 0);
+}
+
+/// Malformed success responses cannot downgrade mutation authorization.
+#[cargo_test]
+fn mutation_authorization_malformed_response_fails_closed() {
+    let publish_count = Arc::new(Mutex::new(0u32));
+    let publish_count2 = publish_count.clone();
+    let _registry = RegistryBuilder::new()
+        .alternative()
+        .http_api()
+        .add_responder("/api/v1/auth/mutation-challenges", |_req, _server| {
+            Response {
+                code: 200,
+                headers: vec!["Cache-Control: no-store".into()],
+                body: br#"{}"#.to_vec(),
+            }
+        })
+        .add_responder("/api/v1/crates/new", move |_req, _server| {
+            *publish_count.lock().unwrap() += 1;
+            Response {
+                code: 200,
+                headers: vec![],
+                body: Vec::new(),
+            }
+        })
+        .build();
+
+    mutation_authorization_publish_project()
+        .cargo("publish --no-verify --registry alternative")
+        .with_status(101)
+        .with_stderr_contains("[..]missing field[..]")
+        .run();
+    assert_eq!(*publish_count2.lock().unwrap(), 0);
+}
+
 /// Version 1 registries receive a descriptor before Cargo uploads the archive.
 #[cargo_test]
-fn step_up_preflight_uploads_publish_body_once() {
+fn mutation_authorization_preflight_uploads_publish_body_once() {
     let preflight_count = Arc::new(Mutex::new(0u32));
     let publish_count = Arc::new(Mutex::new(0u32));
     let preflight_count2 = preflight_count.clone();
@@ -4925,7 +5061,6 @@ fn step_up_preflight_uploads_publish_body_once() {
     let _registry = RegistryBuilder::new()
         .alternative()
         .http_api()
-        .step_up_auth()
         .add_responder("/api/v1/auth/mutation-challenges", move |req, _server| {
             *preflight_count.lock().unwrap() += 1;
             assert_eq!(req.method, "post");
@@ -4934,6 +5069,10 @@ fn step_up_preflight_uploads_publish_body_once() {
                 serde_json::from_slice(req.body.as_deref().unwrap()).unwrap();
             assert_eq!(descriptor["protocol_version"], 1);
             assert_eq!(descriptor["allow_pending"], false);
+            assert_eq!(
+                descriptor["requested_extensions"],
+                serde_json::json!(["idempotent-final"])
+            );
             assert!(descriptor["preflight_id"].as_str().unwrap().starts_with("pf_"));
             assert_eq!(descriptor["operation"], "publish");
             assert_eq!(descriptor["method"], "PUT");
@@ -4951,7 +5090,7 @@ fn step_up_preflight_uploads_publish_body_once() {
             Response {
                 code: 200,
                 headers: vec!["Cache-Control: no-store".into()],
-                body: br#"{"status":"ready","protocol_version":1,"mutation_id":"mut_publish_once_0123456789","grant_expires_in":300}"#.to_vec(),
+                body: br#"{"status":"ready","protocol_version":1,"active_extensions":["idempotent-final"],"mutation_id":"mut_publish_once_0123456789","grant_expires_in":300,"receive_lease_secs":1800}"#.to_vec(),
             }
         })
         .add_responder("/api/v1/crates/new", move |req, server| {
@@ -4992,17 +5131,16 @@ fn step_up_preflight_uploads_publish_body_once() {
 
 /// Core-only registries do not opt Cargo into retrying an ambiguous final request.
 #[cargo_test]
-fn step_up_core_does_not_retry_final_request() {
+fn mutation_authorization_core_does_not_retry_final_request() {
     let publish_count = Arc::new(Mutex::new(0u32));
     let publish_count2 = publish_count.clone();
     let _registry = RegistryBuilder::new()
         .alternative()
         .http_api()
-        .step_up_auth_core()
         .add_responder("/api/v1/auth/mutation-challenges", |_req, _server| Response {
             code: 200,
             headers: vec!["Cache-Control: no-store".into()],
-            body: br#"{"status":"ready","protocol_version":1,"mutation_id":"mut_core_once_01234567890","grant_expires_in":300}"#.to_vec(),
+            body: br#"{"status":"ready","protocol_version":1,"active_extensions":[],"mutation_id":"mut_core_once_01234567890","grant_expires_in":300}"#.to_vec(),
         })
         .add_responder("/api/v1/crates/new", move |_req, _server| {
             *publish_count.lock().unwrap() += 1;
@@ -5037,13 +5175,17 @@ fn step_up_core_does_not_retry_final_request() {
     assert_eq!(*publish_count2.lock().unwrap(), 1);
 }
 
-/// Explicit loopback selection fails closed unless the registry advertises it.
+/// Explicit loopback selection fails closed unless the preflight activates it.
 #[cargo_test]
-fn step_up_core_rejects_explicit_loopback() {
+fn mutation_authorization_core_rejects_explicit_loopback() {
     let _registry = RegistryBuilder::new()
         .alternative()
         .http_api()
-        .step_up_auth_core()
+        .add_responder("/api/v1/auth/mutation-challenges", |_req, _server| Response {
+            code: 200,
+            headers: vec!["Cache-Control: no-store".into()],
+            body: br#"{"status":"ready","protocol_version":1,"active_extensions":["idempotent-final"],"mutation_id":"mut_no_loopback_01234567890","grant_expires_in":300,"receive_lease_secs":1800}"#.to_vec(),
+        })
         .build();
     let p = project()
         .file(
@@ -5065,23 +5207,25 @@ fn step_up_core_rejects_explicit_loopback() {
         .arg("--registry-authorization=loopback")
         .with_status(101)
         .with_stderr_contains(
-            "[..]registry does not advertise the `loopback-callback` authorization extension[..]",
+            "[..]registry did not activate the `loopback-callback` authorization extension[..]",
         )
         .run();
 }
 
-/// Cargo stops receiving an oversized step-up response before parsing it.
+/// Cargo stops receiving an oversized authorization response before parsing it.
 #[cargo_test]
-fn step_up_rejects_oversized_preflight_response() {
+fn mutation_authorization_rejects_oversized_preflight_response() {
+    let preflight_count = Arc::new(Mutex::new(0u32));
+    let preflight_count2 = preflight_count.clone();
     let _registry = RegistryBuilder::new()
         .alternative()
         .http_api()
-        .step_up_auth()
-        .add_responder("/api/v1/auth/mutation-challenges", |_req, _server| {
+        .add_responder("/api/v1/auth/mutation-challenges", move |_req, _server| {
+            *preflight_count.lock().unwrap() += 1;
             Response {
                 code: 403,
                 headers: vec!["Cache-Control: no-store".into()],
-                body: vec![b'x'; crates_io::STEP_UP_RESPONSE_MAX_BYTES + 1],
+                body: vec![b'x'; crates_io::MUTATION_AUTHORIZATION_RESPONSE_MAX_BYTES + 1],
             }
         })
         .build();
@@ -5106,19 +5250,121 @@ fn step_up_rejects_oversized_preflight_response() {
         .with_status(101)
         .with_stderr_contains("[..]HTTP response body exceeded the 65536-byte limit[..]")
         .run();
+    assert_eq!(*preflight_count2.lock().unwrap(), 1);
+}
+
+/// An oversized poll response is fatal and is not downloaded repeatedly.
+#[cargo_test]
+fn mutation_authorization_rejects_oversized_poll_response_once() {
+    let poll_count = Arc::new(Mutex::new(0u32));
+    let poll_count2 = poll_count.clone();
+    let _registry = RegistryBuilder::new()
+        .alternative()
+        .http_api()
+        .add_responder("/api/v1/auth/mutation-challenges", |req, _server| {
+            let origin = req.url.origin().ascii_serialization();
+            Response {
+                code: 202,
+                headers: vec!["Cache-Control: no-store".into()],
+                body: format!(
+                    r#"{{"status":"pending","detail":"Authorize this publish.","protocol_version":1,"active_extensions":[],"mutation_id":"mut_large_poll_01234567890","poll_url":"{origin}/api/v1/auth/mutation-challenges/poll/poll_large_0123456789","challenge_expires_in":300,"recommended_poll_interval_secs":1}}"#
+                )
+                .into_bytes(),
+            }
+        })
+        .add_responder(
+            "/api/v1/auth/mutation-challenges/poll/poll_large_0123456789",
+            move |_req, _server| {
+                *poll_count.lock().unwrap() += 1;
+                Response {
+                    code: 200,
+                    headers: vec!["Cache-Control: no-store".into()],
+                    body: vec![b'x'; crates_io::MUTATION_AUTHORIZATION_RESPONSE_MAX_BYTES + 1],
+                }
+            },
+        )
+        .build();
+
+    let p = project()
+        .file(
+            "Cargo.toml",
+            r#"
+                [package]
+                name = "foo"
+                version = "0.0.1"
+                edition = "2015"
+                authors = []
+                license = "MIT"
+                description = "foo"
+            "#,
+        )
+        .file("src/lib.rs", "")
+        .build();
+
+    p.cargo("publish --no-verify --registry alternative")
+        .arg("--registry-authorization=poll")
+        .with_status(101)
+        .with_stderr_contains("[..]HTTP response body exceeded the 65536-byte limit[..]")
+        .run();
+    assert_eq!(*poll_count2.lock().unwrap(), 1);
+}
+
+/// An oversized final mutation response is fatal and does not repeat the upload.
+#[cargo_test]
+fn mutation_authorization_rejects_oversized_final_response_once() {
+    let publish_count = Arc::new(Mutex::new(0u32));
+    let publish_count2 = publish_count.clone();
+    let _registry = RegistryBuilder::new()
+        .alternative()
+        .http_api()
+        .add_responder("/api/v1/auth/mutation-challenges", |_req, _server| Response {
+            code: 200,
+            headers: vec!["Cache-Control: no-store".into()],
+            body: br#"{"status":"ready","protocol_version":1,"active_extensions":["idempotent-final"],"mutation_id":"mut_large_final_0123456789","grant_expires_in":300,"receive_lease_secs":1800}"#.to_vec(),
+        })
+        .add_responder("/api/v1/crates/new", move |_req, _server| {
+            *publish_count.lock().unwrap() += 1;
+            Response {
+                code: 200,
+                headers: vec!["Content-Type: application/json".into()],
+                body: vec![b'x'; crates_io::MUTATION_RESPONSE_MAX_BYTES + 1],
+            }
+        })
+        .build();
+
+    let p = project()
+        .file(
+            "Cargo.toml",
+            r#"
+                [package]
+                name = "foo"
+                version = "0.0.1"
+                edition = "2015"
+                authors = []
+                license = "MIT"
+                description = "foo"
+            "#,
+        )
+        .file("src/lib.rs", "")
+        .build();
+
+    p.cargo("publish --no-verify --registry alternative")
+        .with_status(101)
+        .with_stderr_contains("[..]HTTP response body exceeded the 1048576-byte limit[..]")
+        .run();
+    assert_eq!(*publish_count2.lock().unwrap(), 1);
 }
 
 /// Cargo refuses HTTP redirects on mutation-authorization poll URLs.
 #[cargo_test]
-fn step_up_rejects_poll_redirect() {
+fn mutation_authorization_rejects_poll_redirect() {
     let _registry = RegistryBuilder::new()
         .alternative()
         .http_api()
-        .step_up_auth()
         .add_responder("/api/v1/auth/mutation-challenges", |req, _server| {
             let origin = req.url.origin().ascii_serialization();
             let body = format!(
-                r#"{{"status":"pending","detail":"Authorize this publish.","protocol_version":1,"mutation_id":"mut_redir_0123456789012345","poll_url":"{origin}/api/v1/auth/mutation-challenges/poll/poll_redir_0123456789","challenge_expires_in":300,"recommended_poll_interval_secs":1}}"#
+                r#"{{"status":"pending","detail":"Authorize this publish.","protocol_version":1,"active_extensions":[],"mutation_id":"mut_redir_0123456789012345","poll_url":"{origin}/api/v1/auth/mutation-challenges/poll/poll_redir_0123456789","challenge_expires_in":300,"recommended_poll_interval_secs":1}}"#
             );
             Response {
                 code: 202,
@@ -5166,16 +5412,15 @@ fn step_up_rejects_poll_redirect() {
 
 /// Cargo refuses poll URLs that do not share the registry API origin.
 #[cargo_test]
-fn step_up_rejects_cross_origin_poll_url() {
+fn mutation_authorization_rejects_cross_origin_poll_url() {
     let _registry = RegistryBuilder::new()
         .alternative()
         .http_api()
-        .step_up_auth()
         .add_responder("/api/v1/auth/mutation-challenges", |_req, _server| {
             Response {
                 code: 202,
                 headers: vec!["Cache-Control: no-store".into()],
-                body: br#"{"status":"pending","detail":"Authorize this publish.","protocol_version":1,"mutation_id":"mut_evil_01234567890123456","poll_url":"http://127.0.0.1:9/evil","challenge_expires_in":300,"recommended_poll_interval_secs":1}"#.to_vec(),
+                body: br#"{"status":"pending","detail":"Authorize this publish.","protocol_version":1,"active_extensions":[],"mutation_id":"mut_evil_01234567890123456","poll_url":"http://127.0.0.1:9/evil","challenge_expires_in":300,"recommended_poll_interval_secs":1}"#.to_vec(),
             }
         })
         .build();
@@ -5210,15 +5455,14 @@ fn step_up_rejects_cross_origin_poll_url() {
 
 /// A missing mutation-authorization record fails with an actionable error.
 #[cargo_test]
-fn step_up_poll_not_found() {
+fn mutation_authorization_poll_not_found() {
     let _registry = RegistryBuilder::new()
         .alternative()
         .http_api()
-        .step_up_auth()
         .add_responder("/api/v1/auth/mutation-challenges", |req, _server| {
             let origin = req.url.origin().ascii_serialization();
             let body = format!(
-                r#"{{"status":"pending","detail":"Authorize this publish.","protocol_version":1,"mutation_id":"mut_gone_01234567890123456","poll_url":"{origin}/api/v1/auth/mutation-challenges/poll/poll_gone_01234567890","challenge_expires_in":300,"recommended_poll_interval_secs":1}}"#
+                r#"{{"status":"pending","detail":"Authorize this publish.","protocol_version":1,"active_extensions":[],"mutation_id":"mut_gone_01234567890123456","poll_url":"{origin}/api/v1/auth/mutation-challenges/poll/poll_gone_01234567890","challenge_expires_in":300,"recommended_poll_interval_secs":1}}"#
             );
             Response {
                 code: 202,
@@ -5264,11 +5508,10 @@ fn step_up_poll_not_found() {
 
 /// Non-interactive auto mode preflights without creating a challenge.
 #[cargo_test]
-fn step_up_fail_fast_when_noninteractive() {
+fn mutation_authorization_fails_fast_when_noninteractive() {
     let _registry = RegistryBuilder::new()
         .alternative()
         .http_api()
-        .step_up_auth()
         .add_responder("/api/v1/auth/mutation-challenges", |req, _server| {
             let descriptor: serde_json::Value =
                 serde_json::from_slice(req.body.as_deref().unwrap()).unwrap();
@@ -5276,7 +5519,7 @@ fn step_up_fail_fast_when_noninteractive() {
             Response {
                 code: 403,
                 headers: vec!["Cache-Control: no-store".into()],
-                body: br#"{"status":"interaction_required","protocol_version":1,"detail":"This operation requires registry authorization."}"#.to_vec(),
+                body: br#"{"status":"interaction_required","protocol_version":1,"active_extensions":[],"detail":"This operation requires registry authorization."}"#.to_vec(),
             }
         })
         .build();

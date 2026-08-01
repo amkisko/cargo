@@ -9,6 +9,7 @@ use cargo_credential::Operation;
 use cargo_credential::Secret;
 
 use crate::context::GlobalContext;
+use crate::util::auth;
 use crate::util::errors::CargoResult;
 use crate::util::important_paths::find_root_manifest_for_wd;
 use crate::workspace::Workspace;
@@ -61,12 +62,25 @@ pub fn yank(
     if undo {
         gctx.shell().status("Unyank", package_spec)?;
         let descriptor = crates_io::MutationDescriptor::yank(&name, &version, true);
-        super::step_up::with_step_up_retry(
+        super::mutation_authorization::with_mutation_authorization(
             gctx,
             &mut registry,
             reg_or_index.as_ref(),
             registry_authorization.as_deref(),
             descriptor,
+            || {
+                auth::auth_token(
+                    gctx,
+                    &source_ids.original,
+                    None,
+                    Operation::Unyank {
+                        name: &name,
+                        vers: &version,
+                    },
+                    vec![],
+                    false,
+                )
+            },
             |registry| registry.unyank(&name, &version),
         )
         .with_context(|| {
@@ -78,12 +92,25 @@ pub fn yank(
     } else {
         gctx.shell().status("Yank", package_spec)?;
         let descriptor = crates_io::MutationDescriptor::yank(&name, &version, false);
-        super::step_up::with_step_up_retry(
+        super::mutation_authorization::with_mutation_authorization(
             gctx,
             &mut registry,
             reg_or_index.as_ref(),
             registry_authorization.as_deref(),
             descriptor,
+            || {
+                auth::auth_token(
+                    gctx,
+                    &source_ids.original,
+                    None,
+                    Operation::Yank {
+                        name: &name,
+                        vers: &version,
+                    },
+                    vec![],
+                    false,
+                )
+            },
             |registry| registry.yank(&name, &version),
         )
         .with_context(|| format!("failed to yank from the registry at {}", registry.host()))?;
